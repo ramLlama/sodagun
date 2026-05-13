@@ -1,32 +1,33 @@
 repos:
   - repo: local
     hooks:
-      - id: ruff-format
-        name: ruff format
+      - id: cargo-fmt
+        name: cargo fmt
         language: system
-        entry: uv run ruff format
-        types: [python]
-        pass_filenames: true
-
-      - id: ruff-lint
-        name: ruff lint
-        language: system
-        entry: uv run ruff check --fix
-        types: [python]
-        pass_filenames: true
-
-      - id: mypy
-        name: mypy
-        language: system
-        entry: uv run mypy
-        types: [python]
+        entry: cargo fmt --all --check
         pass_filenames: false
-        args: [sodagun]
 
-      - id: pytest
-        name: pytest
+      - id: cargo-clippy
+        name: cargo clippy
         language: system
-        entry: uv run pytest
+        entry: cargo clippy --all-targets --all-features -- -D warnings
         pass_filenames: false
-        always_run: true
+
+      - id: cargo-deny
+        name: cargo deny
+        language: system
+        entry: cargo deny check
+        pass_filenames: false
+
+      - id: cargo-audit
+        name: cargo audit
+        language: system
+        entry: cargo audit
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        language: system
+        entry: cargo test
+        pass_filenames: false
         stages: [pre-push]

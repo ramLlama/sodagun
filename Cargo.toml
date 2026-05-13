@@ -1,0 +1,27 @@
+[package]
+name = "sodagun"
+version = "0.1.0"
+edition = "2024"
+description = "A CLI tool for git worktree management"
+license = "MIT"
+
+[[bin]]
+name = "sodagun"
+path = "src/main.rs"
+
+[dependencies]
+clap       = { version = "4", features = ["derive"] }
+git2       = { version = "0.20", features = ["vendored-libgit2"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid       = { version = "1", features = ["v4"] }
+colored    = "3"
+
+[[test]]
+name = "test_add_worktree"
+path = "tests/integration/test_add_worktree.rs"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile   = "3"
