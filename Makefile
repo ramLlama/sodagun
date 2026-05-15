@@ -1,4 +1,4 @@
-.PHONY: deps fmt lint typecheck test audit build install uninstall all
+.PHONY: deps fmt lint typecheck test audit build install uninstall clean all
 
 # Requires cargo-audit and cargo-deny: cargo install cargo-audit cargo-deny
 deps:
@@ -29,5 +29,8 @@ install:
 
 uninstall:
 	cargo uninstall sodagun
+
+clean:
+	cargo clean
 
 all: fmt lint typecheck test audit
