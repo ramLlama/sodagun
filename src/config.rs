@@ -47,6 +47,9 @@ pub struct SandboxConfig {
     pub secrets: HashMap<String, SecretConfig>,
 }
 
+fn default_image() -> String {
+    "alpine:latest".to_string()
+}
 fn default_working_dir() -> String {
     "/workspace".to_string()
 }
@@ -61,6 +64,21 @@ fn default_cpus() -> u8 {
 #[derive(Deserialize)]
 struct ConfigFile {
     sandbox: SandboxConfig,
+}
+
+/// Returns the default [`SandboxConfig`] used when no `.sodagun.toml` is present.
+pub fn default_config() -> SandboxConfig {
+    SandboxConfig {
+        image: Some(default_image()),
+        snapshot: None,
+        working_dir: default_working_dir(),
+        memory_mb: default_memory_mb(),
+        cpus: default_cpus(),
+        volumes: Vec::new(),
+        network: NetworkConfig::default(),
+        env: std::collections::HashMap::new(),
+        secrets: std::collections::HashMap::new(),
+    }
 }
 
 /// Load and validate `.sodagun.toml` from `path`.

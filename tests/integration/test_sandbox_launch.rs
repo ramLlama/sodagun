@@ -8,17 +8,22 @@ fn sodagun() -> Command {
     Command::cargo_bin("sodagun").unwrap()
 }
 
-// --- CONFIG_NOT_FOUND ---
+// --- CONFIG_NOT_FOUND (explicit --config pointing to a missing file) ---
 
 #[test]
-fn config_not_found_text() {
+fn config_not_found_explicit_text() {
     let tmp = TempDir::new().unwrap();
     let worktree = tmp.path().join("worktree");
     fs::create_dir(&worktree).unwrap();
-    // No .sodagun.toml written
 
     sodagun()
-        .args(["sandbox", "launch", worktree.to_str().unwrap()])
+        .args([
+            "sandbox",
+            "launch",
+            worktree.to_str().unwrap(),
+            "--config",
+            "/nonexistent/.sodagun.toml",
+        ])
         .assert()
         .failure()
         .code(1)
@@ -26,7 +31,7 @@ fn config_not_found_text() {
 }
 
 #[test]
-fn config_not_found_json() {
+fn config_not_found_explicit_json() {
     let tmp = TempDir::new().unwrap();
     let worktree = tmp.path().join("worktree");
     fs::create_dir(&worktree).unwrap();
@@ -38,6 +43,8 @@ fn config_not_found_json() {
             "sandbox",
             "launch",
             worktree.to_str().unwrap(),
+            "--config",
+            "/nonexistent/.sodagun.toml",
         ])
         .assert()
         .failure()

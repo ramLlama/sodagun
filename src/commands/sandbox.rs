@@ -72,13 +72,19 @@ fn launch(ctx: Context, args: LaunchArgs) {
         );
     }
 
+    let explicit_config = args.config.is_some();
     let config_path = args
         .config
         .unwrap_or_else(|| args.worktree_path.join(".sodagun.toml"));
 
-    let config = match crate::config::load_config(&config_path) {
-        Ok(c) => c,
-        Err(e) => handle_error(ctx, e),
+    let config = if !config_path.exists() && !explicit_config {
+        // No config file present; use conservative defaults (alpine:latest, airgapped, etc.)
+        crate::config::default_config()
+    } else {
+        match crate::config::load_config(&config_path) {
+            Ok(c) => c,
+            Err(e) => handle_error(ctx, e),
+        }
     };
 
     // Name: sodagun-sb-{worktree_dirname}-{uuid8}
