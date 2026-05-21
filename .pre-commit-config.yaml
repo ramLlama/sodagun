@@ -4,30 +4,24 @@ repos:
       - id: cargo-fmt
         name: cargo fmt
         language: system
-        entry: cargo fmt --all --check
+        entry: make fmt-check
         pass_filenames: false
 
       - id: cargo-clippy
         name: cargo clippy
         language: system
-        entry: cargo clippy --all-targets --all-features -- -D warnings
-        pass_filenames: false
-
-      - id: cargo-deny
-        name: cargo deny
-        language: system
-        entry: cargo deny check
+        entry: make lint
         pass_filenames: false
 
       - id: cargo-audit
         name: cargo audit
         language: system
-        entry: cargo audit
+        entry: make audit
         pass_filenames: false
 
       - id: cargo-test
         name: cargo test
         language: system
-        entry: cargo test
+        entry: make test
         pass_filenames: false
         stages: [pre-push]

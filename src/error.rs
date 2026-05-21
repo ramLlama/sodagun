@@ -2,6 +2,7 @@ use colored::Colorize;
 
 use crate::context::{Context, OutputFormat};
 
+#[derive(Debug)]
 pub struct SodagunError {
     pub code: &'static str,
     pub message: String,

@@ -1,0 +1,298 @@
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use microsandbox::{NetworkPolicy, Sandbox};
+use uuid::Uuid;
+
+use crate::config::NetworkMode;
+use crate::context::{Context, OutputFormat};
+use crate::error::{SodagunError, handle_error};
+
+#[derive(Parser)]
+pub struct SandboxCommand {
+    #[command(subcommand)]
+    pub subcommand: SandboxSubcommand,
+}
+
+#[derive(Subcommand)]
+pub enum SandboxSubcommand {
+    /// Launch a sandbox for a worktree.
+    Launch(LaunchArgs),
+    /// Attach an interactive TTY session to a running sandbox.
+    Attach(AttachArgs),
+}
+
+#[derive(Parser)]
+pub struct LaunchArgs {
+    /// Path to the worktree to mount at the configured working_dir.
+    pub worktree_path: PathBuf,
+
+    /// Path to the sodagun config file (default: <worktree-path>/.sodagun.toml).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+pub struct AttachArgs {
+    /// Name of the sandbox to attach to.
+    pub sandbox_name: String,
+}
+
+pub fn run(ctx: Context, cmd: SandboxCommand) {
+    match cmd.subcommand {
+        SandboxSubcommand::Launch(args) => launch(ctx, args),
+        SandboxSubcommand::Attach(args) => attach(ctx, args),
+    }
+}
+
+fn make_runtime(ctx: Context) -> tokio::runtime::Runtime {
+    match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => handle_error(
+            ctx,
+            SodagunError {
+                code: "SANDBOX_ERROR",
+                message: format!("failed to start async runtime: {e}"),
+            },
+        ),
+    }
+}
+
+fn launch(ctx: Context, args: LaunchArgs) {
+    if !args.worktree_path.is_dir() {
+        handle_error(
+            ctx,
+            SodagunError {
+                code: "WORKTREE_NOT_FOUND",
+                message: format!(
+                    "worktree path does not exist or is not a directory: {}",
+                    args.worktree_path.display()
+                ),
+            },
+        );
+    }
+
+    let config_path = args
+        .config
+        .unwrap_or_else(|| args.worktree_path.join(".sodagun.toml"));
+
+    let config = match crate::config::load_config(&config_path) {
+        Ok(c) => c,
+        Err(e) => handle_error(ctx, e),
+    };
+
+    // Name: sodagun-sb-{worktree_dirname}-{uuid8}
+    let dir_name = args
+        .worktree_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sandbox");
+    let uuid_str = Uuid::new_v4().to_string().replace('-', "");
+    let sandbox_name = format!("sodagun-sb-{}-{}", dir_name, &uuid_str[..8]);
+
+    let rt = make_runtime(ctx);
+    let name = match rt.block_on(launch_async(&sandbox_name, &args.worktree_path, &config)) {
+        Ok(n) => n,
+        Err(e) => handle_error(ctx, e),
+    };
+
+    match ctx.output {
+        OutputFormat::Text => println!("{}", name),
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::json!({ "status": "ok", "sandbox_name": name })
+            )
+        }
+    }
+}
+
+fn attach(ctx: Context, args: AttachArgs) {
+    let rt = make_runtime(ctx);
+    match rt.block_on(attach_async(&args.sandbox_name)) {
+        Ok(exit_code) => std::process::exit(exit_code),
+        Err(e) => handle_error(ctx, e),
+    }
+}
+
+/// Parse a Docker-style volume string ("host:guest" or "host:guest:ro").
+/// Expands a leading `~` in the host path to $HOME.
+fn parse_volume(s: &str) -> Result<(PathBuf, String, bool), SodagunError> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    if parts.len() < 2 {
+        return Err(SodagunError {
+            code: "CONFIG_INVALID",
+            message: format!("volume '{s}' must be 'host:guest' or 'host:guest:ro'"),
+        });
+    }
+    let host_raw = parts[0];
+    let guest = parts[1].to_string();
+    let readonly = parts.get(2).is_some_and(|f| *f == "ro");
+
+    let host = if let Some(rest) = host_raw.strip_prefix('~') {
+        let home = std::env::var("HOME").map_err(|_| SodagunError {
+            code: "CONFIG_INVALID",
+            message: "cannot expand '~' in volume: $HOME is not set".to_string(),
+        })?;
+        PathBuf::from(format!("{home}{rest}"))
+    } else {
+        PathBuf::from(host_raw)
+    };
+
+    Ok((host, guest, readonly))
+}
+
+async fn launch_async(
+    sandbox_name: &str,
+    worktree_path: &std::path::Path,
+    config: &crate::config::SandboxConfig,
+) -> Result<String, SodagunError> {
+    let mut builder = Sandbox::builder(sandbox_name);
+
+    // image and snapshot are mutually exclusive, already validated by load_config
+    if let Some(ref image) = config.image {
+        builder = builder.image(image.as_str());
+    } else if let Some(ref snapshot) = config.snapshot {
+        builder = builder.from_snapshot(snapshot.as_str());
+    }
+
+    builder = builder
+        .cpus(config.cpus)
+        .memory(config.memory_mb)
+        .workdir(&config.working_dir);
+
+    builder = match config.network.mode {
+        NetworkMode::Airgapped => builder.disable_network(),
+        NetworkMode::AllowAll => builder.network(|b| b.policy(NetworkPolicy::allow_all())),
+        NetworkMode::PublicOnly => builder.network(|b| b.policy(NetworkPolicy::public_only())),
+    };
+
+    // Bind-mount the worktree at the configured working_dir
+    let worktree_str = worktree_path.to_str().ok_or_else(|| SodagunError {
+        code: "CONFIG_INVALID",
+        message: "worktree path contains non-UTF-8 characters".to_string(),
+    })?;
+    builder = builder.volume(&config.working_dir, |m| m.bind(worktree_str));
+
+    // Additional volumes declared in config
+    for vol_str in &config.volumes {
+        let (host_path, guest_path, readonly) = parse_volume(vol_str)?;
+        let host_str = host_path
+            .to_str()
+            .ok_or_else(|| SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!("volume host path is non-UTF-8: {}", host_path.display()),
+            })?
+            .to_owned();
+        if readonly {
+            builder = builder.volume(guest_path, move |m| m.bind(&host_str).readonly());
+        } else {
+            builder = builder.volume(guest_path, move |m| m.bind(&host_str));
+        }
+    }
+
+    // Plain env vars
+    builder = builder.envs(config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
+    // Secrets — resolve value_from_env at launch time
+    for (env_var, secret) in &config.secrets {
+        let value = if let Some(ref literal) = secret.value {
+            literal.clone()
+        } else if let Some(ref from_env) = secret.value_from_env {
+            std::env::var(from_env).map_err(|_| SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!(
+                    "secret '{env_var}' references env var '{from_env}' which is not set"
+                ),
+            })?
+        } else {
+            return Err(SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!("secret '{env_var}' has neither 'value' nor 'value_from_env'"),
+            });
+        };
+
+        let env_var_owned = env_var.clone();
+        let allowed_hosts = secret.allowed_hosts.clone();
+        builder = builder.secret(move |s| {
+            let mut s = s.env(&env_var_owned).value(value);
+            for host in &allowed_hosts {
+                if host.contains('*') {
+                    s = s.allow_host_pattern(host);
+                } else {
+                    s = s.allow_host(host);
+                }
+            }
+            s
+        });
+    }
+
+    let sandbox = builder.create_detached().await.map_err(|e| SodagunError {
+        code: "SANDBOX_ERROR",
+        message: format!("failed to create sandbox: {e}"),
+    })?;
+
+    Ok(sandbox.name().to_string())
+}
+
+/// Returns the shell's exit code on a normal interactive session end.
+/// Returns `Err` only on infrastructure failure (connection lost, etc.).
+async fn attach_async(sandbox_name: &str) -> Result<i32, SodagunError> {
+    let sandbox = Sandbox::start(sandbox_name)
+        .await
+        .map_err(|e| SodagunError {
+            code: "SANDBOX_ERROR",
+            message: format!("failed to connect to sandbox '{sandbox_name}': {e}"),
+        })?;
+
+    sandbox.attach_shell().await.map_err(|e| SodagunError {
+        code: "SANDBOX_ERROR",
+        message: format!("attach session failed: {e}"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_volume_basic() {
+        let (host, guest, ro) = parse_volume("/host/path:/guest/path").unwrap();
+        assert_eq!(host, PathBuf::from("/host/path"));
+        assert_eq!(guest, "/guest/path");
+        assert!(!ro);
+    }
+
+    #[test]
+    fn parse_volume_readonly() {
+        let (_, _, ro) = parse_volume("/host:/guest:ro").unwrap();
+        assert!(ro);
+    }
+
+    #[test]
+    fn parse_volume_tilde_expansion() {
+        // Only testable if $HOME is set (it is in any real shell session)
+        if let Ok(home) = std::env::var("HOME") {
+            let (host, _, _) = parse_volume("~/.config/claude:/root/.config/claude:ro").unwrap();
+            assert_eq!(host, PathBuf::from(format!("{home}/.config/claude")));
+        }
+    }
+
+    #[test]
+    fn parse_volume_no_home_error() {
+        // Temporarily unset HOME to force the error path
+        let saved = std::env::var("HOME").ok();
+        unsafe { std::env::remove_var("HOME") };
+        let err = parse_volume("~/.config:/root/.config").unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+        if let Some(h) = saved {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+    }
+
+    #[test]
+    fn parse_volume_missing_guest_error() {
+        let err = parse_volume("/only-host").unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+    }
+}

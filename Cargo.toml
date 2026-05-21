@@ -10,16 +10,23 @@ name = "sodagun"
 path = "src/main.rs"
 
 [dependencies]
-clap       = { version = "4", features = ["derive"] }
-git2       = { version = "0.20", features = ["vendored-libgit2"] }
-serde      = { version = "1", features = ["derive"] }
-serde_json = "1"
-uuid       = { version = "1", features = ["v4"] }
-colored    = "3"
+clap         = { version = "4", features = ["derive"] }
+git2         = { version = "0.20", features = ["vendored-libgit2"] }
+microsandbox = "0.4"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+toml         = "1"
+tokio        = { version = "1", features = ["rt-multi-thread"] }
+uuid         = { version = "1", features = ["v4"] }
+colored      = "3"
 
 [[test]]
 name = "test_add_worktree"
 path = "tests/integration/test_add_worktree.rs"
+
+[[test]]
+name = "test_sandbox_launch"
+path = "tests/integration/test_sandbox_launch.rs"
 
 [dev-dependencies]
 assert_cmd = "2"

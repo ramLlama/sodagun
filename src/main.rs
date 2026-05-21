@@ -1,10 +1,12 @@
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod config;
 mod context;
 mod error;
 
 use commands::git::GitCommand;
+use commands::sandbox::SandboxCommand;
 use context::{Context, OutputFormat};
 
 #[derive(Parser)]
@@ -28,6 +30,8 @@ struct Cli {
 enum Commands {
     /// Git utilities.
     Git(GitCommand),
+    /// Sandbox utilities.
+    Sandbox(SandboxCommand),
 }
 
 fn main() {
@@ -36,5 +40,6 @@ fn main() {
 
     match cli.command {
         Commands::Git(cmd) => commands::git::run(ctx, cmd),
+        Commands::Sandbox(cmd) => commands::sandbox::run(ctx, cmd),
     }
 }
