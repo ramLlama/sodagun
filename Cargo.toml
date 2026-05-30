@@ -16,7 +16,7 @@ microsandbox = "0.4"
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
 toml         = "1"
-tokio        = { version = "1", features = ["rt-multi-thread"] }
+tokio        = { version = "1", features = ["rt-multi-thread", "time"] }
 uuid         = { version = "1", features = ["v4"] }
 colored      = "3"
 
@@ -27,6 +27,10 @@ path = "tests/integration/test_add_worktree.rs"
 [[test]]
 name = "test_sandbox_launch"
 path = "tests/integration/test_sandbox_launch.rs"
+
+[[test]]
+name = "test_sandbox_lifecycle"
+path = "tests/integration/test_sandbox_lifecycle.rs"
 
 [dev-dependencies]
 assert_cmd = "2"

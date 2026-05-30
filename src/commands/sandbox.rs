@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use microsandbox::{NetworkPolicy, Sandbox};
+use microsandbox::sandbox::SandboxStatus;
+use microsandbox::{MicrosandboxError, NetworkPolicy, Sandbox};
 use uuid::Uuid;
 
 use crate::config::NetworkMode;
@@ -20,6 +22,12 @@ pub enum SandboxSubcommand {
     Launch(LaunchArgs),
     /// Attach an interactive TTY session to a running sandbox.
     Attach(AttachArgs),
+    /// List all sandboxes and their statuses.
+    List(ListArgs),
+    /// Stop a running sandbox.
+    Stop(StopArgs),
+    /// Stop and remove a sandbox.
+    Remove(RemoveArgs),
 }
 
 #[derive(Parser)]
@@ -38,10 +46,40 @@ pub struct AttachArgs {
     pub sandbox_name: String,
 }
 
+#[derive(Parser)]
+pub struct ListArgs {}
+
+#[derive(Parser)]
+pub struct StopArgs {
+    /// Name of the sandbox to stop.
+    pub sandbox_name: String,
+
+    /// Seconds to wait for the sandbox to reach stopped state (default: 30).
+    #[arg(long, default_value_t = 30)]
+    pub stop_timeout_seconds: u64,
+
+    /// Send the stop signal and return immediately without waiting.
+    #[arg(long)]
+    pub no_wait: bool,
+}
+
+#[derive(Parser)]
+pub struct RemoveArgs {
+    /// Name of the sandbox to remove.
+    pub sandbox_name: String,
+
+    /// Seconds to wait for the sandbox to stop before removing (default: 30).
+    #[arg(long, default_value_t = 30)]
+    pub stop_timeout_seconds: u64,
+}
+
 pub fn run(ctx: Context, cmd: SandboxCommand) {
     match cmd.subcommand {
         SandboxSubcommand::Launch(args) => launch(ctx, args),
         SandboxSubcommand::Attach(args) => attach(ctx, args),
+        SandboxSubcommand::List(args) => list(ctx, args),
+        SandboxSubcommand::Stop(args) => stop(ctx, args),
+        SandboxSubcommand::Remove(args) => remove(ctx, args),
     }
 }
 
@@ -121,6 +159,73 @@ fn attach(ctx: Context, args: AttachArgs) {
     }
 }
 
+fn list(ctx: Context, _args: ListArgs) {
+    let rt = make_runtime(ctx);
+    let sandboxes = match rt.block_on(list_async()) {
+        Ok(s) => s,
+        Err(e) => handle_error(ctx, e),
+    };
+
+    match ctx.output {
+        OutputFormat::Text => {
+            let name_width = sandboxes
+                .iter()
+                .map(|(n, _)| n.len())
+                .max()
+                .unwrap_or(0)
+                .max("NAME".len());
+            println!("{:<width$}  STATUS", "NAME", width = name_width);
+            for (name, status) in &sandboxes {
+                println!("{:<width$}  {}", name, status, width = name_width);
+            }
+        }
+        OutputFormat::Json => {
+            let items: Vec<_> = sandboxes
+                .iter()
+                .map(|(name, status)| serde_json::json!({"name": name, "status": status}))
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({"status": "ok", "sandboxes": items})
+            );
+        }
+    }
+}
+
+fn stop(ctx: Context, args: StopArgs) {
+    let rt = make_runtime(ctx);
+    let timeout = Duration::from_secs(args.stop_timeout_seconds);
+    match rt.block_on(stop_async(&args.sandbox_name, timeout, args.no_wait)) {
+        Ok(()) => {}
+        Err(e) => handle_error(ctx, e),
+    }
+
+    match ctx.output {
+        OutputFormat::Text => {
+            if args.no_wait {
+                println!("Stop signal sent.");
+            } else {
+                println!("Stopped.");
+            }
+        }
+        OutputFormat::Json => println!("{}", serde_json::json!({"status": "ok"})),
+    }
+}
+
+fn remove(ctx: Context, args: RemoveArgs) {
+    let rt = make_runtime(ctx);
+    let timeout = Duration::from_secs(args.stop_timeout_seconds);
+    match rt.block_on(remove_async(&args.sandbox_name, timeout)) {
+        Ok(()) => {}
+        Err(e) => handle_error(ctx, e),
+    }
+
+    match ctx.output {
+        OutputFormat::Text => println!("Removed."),
+        OutputFormat::Json => println!("{}", serde_json::json!({"status": "ok"})),
+    }
+}
+
 /// Parse a Docker-style volume string ("host:guest" or "host:guest:ro").
 /// Expands a leading `~` in the host path to $HOME.
 fn parse_volume(s: &str) -> Result<(PathBuf, String, bool), SodagunError> {
@@ -146,6 +251,103 @@ fn parse_volume(s: &str) -> Result<(PathBuf, String, bool), SodagunError> {
     };
 
     Ok((host, guest, readonly))
+}
+
+fn status_label(s: SandboxStatus) -> &'static str {
+    match s {
+        SandboxStatus::Running => "running",
+        SandboxStatus::Draining => "draining",
+        SandboxStatus::Paused => "paused",
+        SandboxStatus::Stopped => "stopped",
+        SandboxStatus::Crashed => "crashed",
+    }
+}
+
+fn is_terminal_status(s: SandboxStatus) -> bool {
+    matches!(s, SandboxStatus::Stopped | SandboxStatus::Crashed)
+}
+
+/// Maps a microsandbox SDK error to a SodagunError, using SANDBOX_NOT_FOUND for
+/// unknown sandbox names and SANDBOX_ERROR for all other failures.
+fn map_sdk_err(e: MicrosandboxError, sandbox_name: &str) -> SodagunError {
+    if matches!(e, MicrosandboxError::SandboxNotFound(_)) {
+        SodagunError {
+            code: "SANDBOX_NOT_FOUND",
+            message: format!("sandbox '{sandbox_name}' not found"),
+        }
+    } else {
+        SodagunError {
+            code: "SANDBOX_ERROR",
+            message: format!("{e}"),
+        }
+    }
+}
+
+/// Polls `Sandbox::get` every 500ms until the sandbox reaches a terminal status
+/// (Stopped or Crashed), or until `timeout` elapses. Checks status before sleeping
+/// so fast-stopping sandboxes are detected immediately.
+async fn poll_until_stopped(name: &str, timeout: Duration) -> Result<(), SodagunError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let handle = Sandbox::get(name).await.map_err(|e| map_sdk_err(e, name))?;
+        if is_terminal_status(handle.status()) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(SodagunError {
+                code: "SANDBOX_ERROR",
+                message: format!(
+                    "timed out waiting for sandbox '{name}' to stop after {}s",
+                    timeout.as_secs()
+                ),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn list_async() -> Result<Vec<(String, String)>, SodagunError> {
+    let handles = Sandbox::list().await.map_err(|e| SodagunError {
+        code: "SANDBOX_ERROR",
+        message: format!("failed to list sandboxes: {e}"),
+    })?;
+    Ok(handles
+        .into_iter()
+        .map(|h| (h.name().to_string(), status_label(h.status()).to_string()))
+        .collect())
+}
+
+async fn stop_async(name: &str, timeout: Duration, no_wait: bool) -> Result<(), SodagunError> {
+    let handle = Sandbox::get(name).await.map_err(|e| map_sdk_err(e, name))?;
+    // Already terminal — stop is a no-op.
+    if is_terminal_status(handle.status()) {
+        return Ok(());
+    }
+    handle.stop().await.map_err(|e| SodagunError {
+        code: "SANDBOX_ERROR",
+        message: format!("failed to send stop signal to '{name}': {e}"),
+    })?;
+    if !no_wait {
+        poll_until_stopped(name, timeout).await?;
+    }
+    Ok(())
+}
+
+async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunError> {
+    let handle = Sandbox::get(name).await.map_err(|e| map_sdk_err(e, name))?;
+
+    // Implicitly stop if still running before attempting removal.
+    if !is_terminal_status(handle.status()) {
+        handle.stop().await.map_err(|e| SodagunError {
+            code: "SANDBOX_ERROR",
+            message: format!("failed to send stop signal to '{name}': {e}"),
+        })?;
+        poll_until_stopped(name, timeout).await?;
+    }
+
+    Sandbox::remove(name)
+        .await
+        .map_err(|e| map_sdk_err(e, name))
 }
 
 async fn launch_async(
@@ -259,7 +461,12 @@ async fn attach_async(sandbox_name: &str) -> Result<i32, SodagunError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    // Serialize tests that mutate $HOME to prevent races with parse_volume_tilde_expansion.
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_volume_basic() {
@@ -277,7 +484,7 @@ mod tests {
 
     #[test]
     fn parse_volume_tilde_expansion() {
-        // Only testable if $HOME is set (it is in any real shell session)
+        let _guard = HOME_LOCK.lock().unwrap();
         if let Ok(home) = std::env::var("HOME") {
             let (host, _, _) = parse_volume("~/.config/claude:/root/.config/claude:ro").unwrap();
             assert_eq!(host, PathBuf::from(format!("{home}/.config/claude")));
@@ -286,7 +493,7 @@ mod tests {
 
     #[test]
     fn parse_volume_no_home_error() {
-        // Temporarily unset HOME to force the error path
+        let _guard = HOME_LOCK.lock().unwrap();
         let saved = std::env::var("HOME").ok();
         unsafe { std::env::remove_var("HOME") };
         let err = parse_volume("~/.config:/root/.config").unwrap_err();

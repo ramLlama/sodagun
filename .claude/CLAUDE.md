@@ -49,14 +49,43 @@ JSON error: `{"status": "error", "code": "<CODE>"}`
 
 Reconnects to a running named sandbox (`Sandbox::start`) and attaches an interactive TTY shell (`attach_shell()`). On a normal session end, exits with the shell's exit code via `std::process::exit()`. Only emits a `SANDBOX_ERROR` on infrastructure failure (connection lost, etc.).
 
+### `sandbox list`
+
+Lists all sandboxes and their statuses via `Sandbox::list()`.
+
+Text success: aligned `NAME` / `STATUS` table (status lowercased).
+JSON success: `{"status": "ok", "sandboxes": [{"name": "...", "status": "running"}, ...]}`
+
+### `sandbox stop <sandbox-name>`
+
+Sends a graceful shutdown signal to a named sandbox via `Sandbox::get(name)` → `handle.stop()`.
+
+Options:
+- `--stop-timeout-seconds <N>` — seconds to poll for the sandbox to reach `stopped`/`crashed` (default: 30)
+- `--no-wait` — return immediately after sending the stop signal without polling
+
+Text success: `"Stopped."` (or `"Stop signal sent."` with `--no-wait`)
+JSON success: `{"status": "ok"}`
+
+### `sandbox remove <sandbox-name>`
+
+Removes a sandbox. If it is still running, sends a stop signal and polls until it halts before calling `Sandbox::remove(name)`.
+
+Options:
+- `--stop-timeout-seconds <N>` — seconds to wait for the implicit stop phase (default: 30)
+
+Text success: `"Removed."`
+JSON success: `{"status": "ok"}`
+
 ### Sandbox error codes
 
-`WORKTREE_NOT_FOUND`, `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `SANDBOX_ERROR`
+`WORKTREE_NOT_FOUND`, `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `SANDBOX_NOT_FOUND`, `SANDBOX_ERROR`
 
 - `WORKTREE_NOT_FOUND` — worktree path does not exist or is not a directory
 - `CONFIG_NOT_FOUND` — `.sodagun.toml` missing from the config path
 - `CONFIG_INVALID` — malformed TOML; missing `image`/`snapshot`; `image`+`snapshot` conflict; env/secret key conflict; invalid network mode; `cpus` out of `u8` range; bad volume format; `$HOME` not set for `~` expansion; unresolvable `value_from_env`; non-UTF-8 paths
-- `SANDBOX_ERROR` — microsandbox SDK failure (runtime creation, `create_detached`, `start`, `attach_shell`)
+- `SANDBOX_NOT_FOUND` — named sandbox does not exist (maps `MicrosandboxError::SandboxNotFound`); emitted by `stop`, `remove`
+- `SANDBOX_ERROR` — microsandbox SDK failure (runtime creation, `create_detached`, `start`, `attach_shell`, stop/remove ops, stop timeout)
 
 ### `.sodagun.toml` format
 
@@ -100,11 +129,12 @@ src/
   commands/
     mod.rs
     git.rs            # GitCommand sub-app; add_worktree logic
-    sandbox.rs        # SandboxCommand sub-app; launch()/attach() + async impls, parse_volume()
+    sandbox.rs        # SandboxCommand sub-app; launch()/attach()/list()/stop()/remove() + async impls, parse_volume(), poll_until_stopped(), map_sdk_err(), status_label()
 tests/
   integration/
-    test_add_worktree.rs     # registered via [[test]] in Cargo.toml
-    test_sandbox_launch.rs   # registered via [[test]] in Cargo.toml
+    test_add_worktree.rs       # registered via [[test]] in Cargo.toml
+    test_sandbox_launch.rs     # registered via [[test]] in Cargo.toml
+    test_sandbox_lifecycle.rs  # registered via [[test]] in Cargo.toml
 Cargo.toml
 deny.toml             # cargo-deny policy (permissive license allowances + microsandbox advisory ignores)
 Makefile
@@ -120,7 +150,9 @@ Key invariants:
 - `repo.revparse_single()` returns `ErrorCode::NotFound` for unknown refs (equivalent to Python's `KeyError`) -- caught separately from other git errors
 - Top-level error handling uses the `handle_error(ctx, SodagunError { code, message }) -> !` pattern rather than `?` / `Result` propagation, so error codes and exit semantics stay explicit
 - `sandbox attach` is the one command that exits with a non-1 code on success: it propagates the shell's exit code via `std::process::exit()` rather than printing a success payload
-- Async sandbox SDK calls are bridged to the synchronous handlers with a per-invocation `tokio` multi-thread runtime (`make_runtime`); the `launch_async` / `attach_async` functions own all `.await`s
+- Async sandbox SDK calls are bridged to the synchronous handlers with a per-invocation `tokio` multi-thread runtime (`make_runtime`); the `launch_async` / `attach_async` / `list_async` / `stop_async` / `remove_async` functions own all `.await`s
+- `map_sdk_err()` in `sandbox.rs` maps `MicrosandboxError::SandboxNotFound` → `SANDBOX_NOT_FOUND` and all other SDK errors → `SANDBOX_ERROR`
+- `poll_until_stopped()` polls `Sandbox::get().status()` every 500ms using `tokio::time::sleep`; returns `SANDBOX_ERROR` on timeout
 
 ## Dev workflow
 
@@ -141,12 +173,13 @@ make install    # cargo install --path .
 - Integration helper `make_git_repo()` does `init_repository`, creates one commit, and writes a `refs/remotes/origin/main` ref so `--base origin/main` resolves out of the box
 - Unit tests live in `#[cfg(test)]` modules inside `src/commands/git.rs` and cover the pure naming contract (e.g. worktree path construction); no mocking layer for `git2`
 - `tests/integration/test_sandbox_launch.rs` -- 6 error-path tests (CONFIG_NOT_FOUND, malformed TOML, image/snapshot conflict, each in text + json) plus `launch_creates_sandbox`, which is `#[ignore]`d (reason: "requires KVM or Apple Silicon hvf, and a valid image") since it needs hardware virtualization
+- `tests/integration/test_sandbox_lifecycle.rs` -- list (JSON shape + text header), stop/remove SANDBOX_NOT_FOUND (text + json each), plus two `#[ignore]`d happy-path tests (stop running sandbox, remove running sandbox with implicit stop)
 - `src/config.rs` has 16 `#[cfg(test)]` unit tests covering valid configs, defaults, and every `CONFIG_INVALID` / `CONFIG_NOT_FOUND` path; `parse_volume` unit tests live in `src/commands/sandbox.rs`
 - Volume tilde tests in `src/config.rs` assert `~` is preserved (not expanded) at parse time; `sandbox.rs` tests cover the launch-time expansion (and the `$HOME`-unset error path, which mutates the env var)
 
 ## Dependencies
 
-Runtime: `clap` (derive), `git2` (`vendored-libgit2`), `microsandbox` (0.4), `serde` + `serde_json`, `toml`, `tokio` (`rt-multi-thread`), `uuid` (v4), `colored`
+Runtime: `clap` (derive), `git2` (`vendored-libgit2`), `microsandbox` (0.4), `serde` + `serde_json`, `toml`, `tokio` (`rt-multi-thread`, `time`), `uuid` (v4), `colored`
 Dev: `assert_cmd`, `predicates`, `tempfile`
 Supply chain: `cargo-deny` + `cargo-audit` wired into pre-commit and `make audit`; `Cargo.lock` is committed. `deny.toml` allows additional permissive licenses (ISC, BSD-3-Clause, 0BSD, CDLA-Permissive-2.0, etc.) and ignores specific advisories pulled in by `microsandbox` transitive deps; `make audit` mirrors those ignores with `--ignore` flags
 
