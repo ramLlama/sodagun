@@ -49,6 +49,8 @@ pub struct ImageConfig {
     pub setup_script: Option<String>,
     /// Files injected into `/setup-assets/` during snapshot creation.
     pub setup_files: Vec<SetupFile>,
+    /// Environment variables passed to the ephemeral sandbox during snapshot creation.
+    pub env: HashMap<String, String>,
 }
 
 impl ImageConfig {
@@ -111,6 +113,8 @@ struct RawImageConfig {
     setup_script_path: Option<String>,
     /// Paths relative to the config file; resolved to `SetupFile`s in `validate_image_config`.
     setup_files: Option<Vec<String>>,
+    #[serde(default)]
+    env: HashMap<String, String>,
 }
 
 fn default_working_dir() -> String {
@@ -151,6 +155,7 @@ pub fn default_image_config() -> ImageConfig {
         base_snapshot: None,
         setup_script: None,
         setup_files: Vec::new(),
+        env: HashMap::new(),
     }
 }
 
@@ -277,6 +282,7 @@ fn validate_image_config(
         base_snapshot: raw.base_snapshot,
         setup_script,
         setup_files,
+        env: raw.env,
     })
 }
 
@@ -351,6 +357,30 @@ setup_script = "#!/bin/bash\napt-get update\n"
         cfg.write_all(config_content.as_bytes()).unwrap();
         let (img, _) = load_config(cfg.path()).unwrap();
         assert!(img.setup_script.as_deref().unwrap().contains("echo hello"));
+    }
+
+    #[test]
+    fn valid_image_env() {
+        let f = write_config(
+            r#"
+[image]
+base_image = "alpine"
+
+[image.env]
+HOME = "/root"
+CUSTOM = "value"
+"#,
+        );
+        let (img, _) = load_config(f.path()).unwrap();
+        assert_eq!(img.env.get("HOME").map(String::as_str), Some("/root"));
+        assert_eq!(img.env.get("CUSTOM").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn valid_image_env_defaults_empty() {
+        let f = write_config("[image]\nbase_image = \"alpine\"\n");
+        let (img, _) = load_config(f.path()).unwrap();
+        assert!(img.env.is_empty());
     }
 
     #[test]

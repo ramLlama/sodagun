@@ -235,6 +235,13 @@ async fn create_async(
         .network(|b| b.policy(NetworkPolicy::allow_all()))
         // Give /tmp plenty of room for build artifacts (e.g. cargo compiling large C deps).
         .volume("/tmp", |m| m.tmpfs().size(8192u32))
+        // Env vars for the ephemeral build sandbox (e.g. HOME).
+        .envs(
+            image_config
+                .env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        )
         // Inject the setup script and any setup_files into /setup-assets/ via patches.
         .patch(|p| {
             let mut p = p.text("/setup-assets/setup", script, Some(0o755), false);
