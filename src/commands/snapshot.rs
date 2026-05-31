@@ -5,7 +5,6 @@ use crate::context::{Context, OutputFormat};
 use crate::error::{SodagunError, handle_error};
 use clap::{Parser, Subcommand};
 use microsandbox::{ExecEvent, MicrosandboxError, NetworkPolicy, Sandbox, Snapshot};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -236,16 +235,28 @@ async fn create_async(
         .network(|b| b.policy(NetworkPolicy::allow_all()))
         // Give /tmp plenty of room for build artifacts (e.g. cargo compiling large C deps).
         .volume("/tmp", |m| m.tmpfs().size(8192u32))
-        .script("setup", script);
+        // Inject the setup script and any setup_files into /setup-assets/ via patches.
+        .patch(|p| {
+            let mut p = p.text("/setup-assets/setup", script, Some(0o755), false);
+            for f in &image_config.setup_files {
+                p = p.file(
+                    format!("/setup-assets/{}", f.name),
+                    f.content.clone(),
+                    None,
+                    false,
+                );
+            }
+            p
+        });
 
     let sandbox = builder.create().await.map_err(|e| SodagunError {
         code: "SNAPSHOT_ERROR",
         message: format!("failed to create ephemeral sandbox: {e}"),
     })?;
 
-    // Run the setup script, streaming stdout/stderr to the user unless --quiet.
+    // Run the setup script directly (no shell wrapper — script has a shebang and is mode 0o755).
     let mut handle = sandbox
-        .shell_stream("setup")
+        .exec_stream("/setup-assets/setup", std::iter::empty::<&str>())
         .await
         .map_err(|e| SodagunError {
             code: "SNAPSHOT_ERROR",
@@ -295,7 +306,9 @@ async fn create_async(
         message: format!("failed to stop ephemeral sandbox: {e}"),
     })?;
 
-    let hex_sha256 = hex::encode(Sha256::digest(script.as_bytes()));
+    // The 12-char base64url hash suffix from the snapshot name is already the authoritative
+    // combined hash of the script + setup_files, so reuse it as the label value.
+    let setup_hash = snapshot_name.rsplit_once('_').map(|(_, h)| h).unwrap_or("");
     let source_ref = image_config
         .base_image
         .as_deref()
@@ -304,7 +317,7 @@ async fn create_async(
 
     Snapshot::builder(&ephemeral_name)
         .name(snapshot_name)
-        .label("setup_script_sha256", &hex_sha256)
+        .label("setup_hash", setup_hash)
         .label("source_image", source_ref)
         .label("created_by", "sodagun")
         .create()

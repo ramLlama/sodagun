@@ -7,6 +7,14 @@ use sha2::{Digest, Sha256};
 
 use crate::error::SodagunError;
 
+/// A file to inject into `/setup-assets/` during snapshot creation.
+#[derive(Debug)]
+pub struct SetupFile {
+    /// Basename used as `/setup-assets/<name>`.
+    pub name: String,
+    pub content: Vec<u8>,
+}
+
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum NetworkMode {
@@ -32,13 +40,15 @@ pub struct SecretConfig {
 /// Resolved image/snapshot configuration from the `[image]` TOML table.
 ///
 /// `setup_script` is always the resolved script content (either inline or read
-/// from `setup_script_path`). `setup_script_path` is preserved for error messages.
+/// from `setup_script_path`). `setup_files` are resolved at load time.
 #[derive(Debug)]
 pub struct ImageConfig {
     pub base_image: Option<String>,
     pub base_snapshot: Option<String>,
     /// Resolved setup script content; `None` means no setup, boot base directly.
     pub setup_script: Option<String>,
+    /// Files injected into `/setup-assets/` during snapshot creation.
+    pub setup_files: Vec<SetupFile>,
 }
 
 impl ImageConfig {
@@ -51,13 +61,23 @@ impl ImageConfig {
             .as_deref()
             .or(self.base_snapshot.as_deref())
             .unwrap_or("");
-        Some(snapshot_name(base, script))
+        Some(snapshot_name(base, script, &self.setup_files))
     }
 }
 
-/// Computes the deterministic snapshot name: `<sanitized_base>_<12 base64url chars of SHA256(script)>`.
-pub fn snapshot_name(base: &str, script: &str) -> String {
-    let hash = Sha256::digest(script.as_bytes());
+/// Computes the deterministic snapshot name: `<sanitized_base>_<12 base64url chars of SHA256(script + setup_files)>`.
+///
+/// Setup files are sorted by name before hashing so the result is order-independent.
+pub fn snapshot_name(base: &str, script: &str, setup_files: &[SetupFile]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(script.as_bytes());
+    let mut sorted: Vec<_> = setup_files.iter().collect();
+    sorted.sort_by_key(|f| &f.name);
+    for f in sorted {
+        hasher.update(f.name.as_bytes());
+        hasher.update(&f.content);
+    }
+    let hash = hasher.finalize();
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hash[..]);
     let prefix = &b64[..12];
     let sanitized = base.replace([':', '/', '@'], "-");
@@ -89,6 +109,8 @@ struct RawImageConfig {
     base_snapshot: Option<String>,
     setup_script: Option<String>,
     setup_script_path: Option<String>,
+    /// Paths relative to the config file; resolved to `SetupFile`s in `validate_image_config`.
+    setup_files: Option<Vec<String>>,
 }
 
 fn default_working_dir() -> String {
@@ -128,6 +150,7 @@ pub fn default_image_config() -> ImageConfig {
         base_image: Some("alpine:latest".to_string()),
         base_snapshot: None,
         setup_script: None,
+        setup_files: Vec::new(),
     }
 }
 
@@ -229,10 +252,31 @@ fn validate_image_config(
         raw.setup_script
     };
 
+    // Resolve setup_files paths → SetupFile { name, content }
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let mut setup_files = Vec::new();
+    for path_str in raw.setup_files.unwrap_or_default() {
+        let abs = config_dir.join(&path_str);
+        let name = abs
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!("setup_files entry '{path_str}' has a non-UTF-8 basename"),
+            })?
+            .to_string();
+        let content = std::fs::read(&abs).map_err(|e| SodagunError {
+            code: "CONFIG_INVALID",
+            message: format!("failed to read setup_files entry '{}': {e}", abs.display()),
+        })?;
+        setup_files.push(SetupFile { name, content });
+    }
+
     Ok(ImageConfig {
         base_image: raw.base_image,
         base_snapshot: raw.base_snapshot,
         setup_script,
+        setup_files,
     })
 }
 
@@ -240,7 +284,7 @@ fn validate_image_config(
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     fn write_config(content: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
@@ -442,35 +486,91 @@ allowed_hosts = ["api.anthropic.com"]
 
     #[test]
     fn snapshot_name_deterministic() {
-        let a = snapshot_name("alpine:latest", "#!/bin/sh\napk add git\n");
-        let b = snapshot_name("alpine:latest", "#!/bin/sh\napk add git\n");
+        let a = snapshot_name("alpine:latest", "#!/bin/sh\napk add git\n", &[]);
+        let b = snapshot_name("alpine:latest", "#!/bin/sh\napk add git\n", &[]);
         assert_eq!(a, b);
     }
 
     #[test]
     fn snapshot_name_changes_with_script() {
-        let a = snapshot_name("alpine:latest", "#!/bin/sh\napk add git\n");
-        let b = snapshot_name("alpine:latest", "#!/bin/sh\napk add curl\n");
+        let a = snapshot_name("alpine:latest", "#!/bin/sh\napk add git\n", &[]);
+        let b = snapshot_name("alpine:latest", "#!/bin/sh\napk add curl\n", &[]);
         assert_ne!(a, b);
     }
 
     #[test]
     fn snapshot_name_sanitizes_image() {
-        let name = snapshot_name("alpine:latest", "#!/bin/sh\n");
+        let name = snapshot_name("alpine:latest", "#!/bin/sh\n", &[]);
         assert!(name.starts_with("alpine-latest_"));
     }
 
     #[test]
     fn snapshot_name_sanitizes_slash_and_at() {
-        let name = snapshot_name("ghcr.io/foo/bar:v1", "#!/bin/sh\n");
+        let name = snapshot_name("ghcr.io/foo/bar:v1", "#!/bin/sh\n", &[]);
         assert!(name.starts_with("ghcr.io-foo-bar-v1_"));
     }
 
     #[test]
     fn snapshot_name_hash_length() {
-        let name = snapshot_name("alpine:latest", "#!/bin/sh\n");
+        let name = snapshot_name("alpine:latest", "#!/bin/sh\n", &[]);
         // format is "<sanitized>_<12chars>"
         let hash_part = name.rsplit_once('_').unwrap().1;
         assert_eq!(hash_part.len(), 12);
+    }
+
+    #[test]
+    fn snapshot_name_changes_with_setup_file_content() {
+        let files_a = vec![SetupFile {
+            name: "rust-toolchain.toml".to_string(),
+            content: b"[toolchain]\nchannel = \"1.85\"".to_vec(),
+        }];
+        let files_b = vec![SetupFile {
+            name: "rust-toolchain.toml".to_string(),
+            content: b"[toolchain]\nchannel = \"1.86\"".to_vec(),
+        }];
+        let a = snapshot_name("alpine:latest", "#!/bin/sh\n", &files_a);
+        let b = snapshot_name("alpine:latest", "#!/bin/sh\n", &files_b);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn snapshot_name_stable_with_same_setup_files() {
+        let files = vec![
+            SetupFile {
+                name: "Cargo.lock".to_string(),
+                content: b"[lock-file]".to_vec(),
+            },
+            SetupFile {
+                name: "rust-toolchain.toml".to_string(),
+                content: b"[toolchain]".to_vec(),
+            },
+        ];
+        let a = snapshot_name("alpine:latest", "#!/bin/sh\n", &files);
+        let b = snapshot_name("alpine:latest", "#!/bin/sh\n", &files);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn setup_files_parsed_and_resolved() {
+        use std::io::Write as _;
+        let tmp = TempDir::new().unwrap();
+        let asset = tmp.path().join("rust-toolchain.toml");
+        std::fs::write(&asset, "[toolchain]\nchannel = \"stable\"").unwrap();
+        let config_content = "[image]\nbase_image = \"alpine\"\nsetup_script = \"#!/bin/sh\\n\"\nsetup_files = [\"rust-toolchain.toml\"]\n".to_string();
+        let mut cfg = NamedTempFile::new_in(tmp.path()).unwrap();
+        cfg.write_all(config_content.as_bytes()).unwrap();
+        let (img, _) = load_config(cfg.path()).unwrap();
+        assert_eq!(img.setup_files.len(), 1);
+        assert_eq!(img.setup_files[0].name, "rust-toolchain.toml");
+        assert!(img.setup_files[0].content.starts_with(b"[toolchain]"));
+    }
+
+    #[test]
+    fn setup_files_missing_file_returns_config_invalid() {
+        let f = write_config(
+            "[image]\nbase_image = \"alpine\"\nsetup_script = \"#!/bin/sh\\n\"\nsetup_files = [\"nonexistent.toml\"]\n",
+        );
+        let err = load_config(f.path()).unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
     }
 }

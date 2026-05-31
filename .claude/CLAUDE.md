@@ -109,7 +109,7 @@ JSON success: `{"status": "ok"}`
 
 - `WORKTREE_NOT_FOUND` — worktree path does not exist or is not a directory
 - `CONFIG_NOT_FOUND` — `.sodagun.toml` missing from the config path
-- `CONFIG_INVALID` — malformed TOML; missing `base_image`/`base_snapshot` in `[image]`; both set together; `setup_script`+`setup_script_path` conflict; env/secret key conflict; invalid network mode; `cpus` out of `u8` range; bad volume format; `$HOME` not set for `~` expansion; unresolvable `value_from_env`; non-UTF-8 paths
+- `CONFIG_INVALID` — malformed TOML; missing `base_image`/`base_snapshot` in `[image]`; both set together; `setup_script`+`setup_script_path` conflict; a missing/unreadable `setup_files` entry; a `setup_files` entry with a non-UTF-8 basename; env/secret key conflict; invalid network mode; `cpus` out of `u8` range; bad volume format; `$HOME` not set for `~` expansion; unresolvable `value_from_env`; non-UTF-8 paths
 - `SANDBOX_NOT_FOUND` — named sandbox does not exist (maps `MicrosandboxError::SandboxNotFound`); emitted by `stop`, `remove`
 - `SANDBOX_ERROR` — microsandbox SDK failure (runtime creation, `create_detached`, `start`, `attach_shell`, stop/remove ops, stop timeout)
 
@@ -126,6 +126,7 @@ set -e
 apt-get install -y git
 """
 # setup_script_path = "./setup.sh"  # alternative to inline setup_script (mutually exclusive)
+setup_files = ["rust-toolchain.toml", "Cargo.toml"]  # paths relative to config file; injected into /setup-assets/ during snapshot create
 
 [sandbox]
 working_dir = "/workspace"  # default
@@ -134,7 +135,7 @@ cpus = 1                    # default; type u8 (serde rejects values > 255 at pa
 volumes = ["~/.config/claude:/root/.config/claude:ro"]
 
 [sandbox.network]
-mode = "airgapped"   # default; options: airgapped, public-only, allow-all (kebab-case)
+mode = "airgapped"   # default; options: airgapped, public-only, allow-all (kebab-case). This repo's own .sodagun.toml uses airgapped (deps are pre-fetched into the snapshot via setup_files + cargo fetch)
 
 [sandbox.env]
 TERM = "xterm-256color"
@@ -148,7 +149,8 @@ allowed_hosts = ["api.anthropic.com"]
 - Exactly one of `base_image` / `base_snapshot` is required; they are mutually exclusive
 - At most one of `setup_script` / `setup_script_path`; they are mutually exclusive
 - `setup_script_path` is resolved relative to the config file at load time
-- Snapshot name is `<sanitized-base>_<first-12-hex-chars-of-sha256(script)>`; deterministic given the same base+script
+- `setup_files` is a list of paths relative to the config file; each is resolved at load time into a `SetupFile { name, content }` (basename + raw bytes) and injected into `/setup-assets/<name>` via a patch during snapshot creation. A missing/unreadable entry or a non-UTF-8 basename is `CONFIG_INVALID`
+- Snapshot name is `<sanitized-base>_<first-12-base64url-chars-of-sha256(script + setup_files)>`; setup file contents are hashed sorted by name, so the name is deterministic given the same base + script + setup_files
 
 Sandbox key invariants:
 - `[image]` section is required; `[sandbox]` is optional (all fields have defaults)
@@ -167,7 +169,7 @@ src/
   main.rs             # clap Cli struct, main(), dispatch
   context.rs          # OutputFormat (clap::ValueEnum, Default) + Context struct
   error.rs            # SodagunError (now #[derive(Debug)]), handle_error() -> !
-  config.rs           # .sodagun.toml parser; ImageConfig, SandboxConfig, NetworkConfig, SecretConfig, NetworkMode, load_config(), load_image_config()
+  config.rs           # .sodagun.toml parser; ImageConfig (incl. setup_files: Vec<SetupFile>), SetupFile { name, content }, SandboxConfig, NetworkConfig, SecretConfig, NetworkMode, load_config(), load_image_config(), snapshot_name()
   commands/
     mod.rs
     git.rs            # GitCommand sub-app; add_worktree logic
@@ -197,6 +199,7 @@ Key invariants:
 - Async sandbox SDK calls are bridged to the synchronous handlers with a per-invocation `tokio` multi-thread runtime (`make_runtime`); the `launch_async` / `attach_async` / `list_async` / `stop_async` / `remove_async` functions own all `.await`s
 - `map_sdk_err()` in `sandbox.rs` maps `MicrosandboxError::SandboxNotFound` → `SANDBOX_NOT_FOUND` and all other SDK errors → `SANDBOX_ERROR`
 - `poll_until_stopped()` polls `Sandbox::get().status()` every 500ms using `tokio::time::sleep`; returns `SANDBOX_ERROR` on timeout
+- `snapshot create` builds the ephemeral sandbox with `.patch(...)` (replacing the older `.script()` + `shell_stream()` approach): the setup script is patched to `/setup-assets/setup` with mode `0o755`, and each `setup_files` entry is patched to `/setup-assets/<name>`. The script is then run directly via `sandbox.exec_stream("/setup-assets/setup", ...)`. The resulting snapshot carries a `setup_hash` label equal to the 12-char base64url suffix of the snapshot name (which covers both the script and setup_files)
 
 ## Dev workflow
 

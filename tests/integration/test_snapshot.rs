@@ -211,6 +211,46 @@ fn snapshot_create_no_setup_script_json() {
         .stdout(predicate::str::contains("CONFIG_INVALID"));
 }
 
+// ── CONFIG_INVALID: setup_files with a missing file ──────────────────────────
+
+#[test]
+fn snapshot_create_setup_files_missing_file_text() {
+    let tmp = config_dir(
+        "[image]\nbase_image = \"alpine:latest\"\nsetup_script = \"#!/bin/sh\\n\"\nsetup_files = [\"nonexistent.toml\"]\n",
+    );
+    sodagun()
+        .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
+            "snapshot",
+            "create",
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("CONFIG_INVALID"));
+}
+
+#[test]
+fn snapshot_create_setup_files_missing_file_json() {
+    let tmp = config_dir(
+        "[image]\nbase_image = \"alpine:latest\"\nsetup_script = \"#!/bin/sh\\n\"\nsetup_files = [\"nonexistent.toml\"]\n",
+    );
+    sodagun()
+        .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
+            "--output",
+            "json",
+            "snapshot",
+            "create",
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("CONFIG_INVALID"));
+}
+
 // ── SNAPSHOT_NOT_FOUND: remove non-existent snapshot ──────────────────────────
 
 /// Config with a setup_script whose derived snapshot name won't exist.
