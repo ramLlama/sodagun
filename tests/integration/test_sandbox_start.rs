@@ -144,7 +144,7 @@ fn config_invalid_bad_toml_json() {
         .stdout(predicate::str::contains("CONFIG_INVALID"));
 }
 
-// --- CONFIG_INVALID: image/snapshot conflict ---
+// --- CONFIG_INVALID: base_image/base_snapshot conflict ---
 
 #[test]
 fn config_invalid_image_snapshot_conflict_text() {
@@ -153,7 +153,7 @@ fn config_invalid_image_snapshot_conflict_text() {
     make_workspace(&rootdir, "feature");
     fs::write(
         rootdir.join("feature").join(".sodagun.toml"),
-        "[sandbox]\nimage = \"debian\"\nsnapshot = \"my-snap\"\n",
+        "[image]\nbase_image = \"debian\"\nbase_snapshot = \"my-snap\"\n",
     )
     .unwrap();
 
@@ -172,7 +172,7 @@ fn config_invalid_image_snapshot_conflict_json() {
     make_workspace(&rootdir, "feature");
     fs::write(
         rootdir.join("feature").join(".sodagun.toml"),
-        "[sandbox]\nimage = \"debian\"\nsnapshot = \"my-snap\"\n",
+        "[image]\nbase_image = \"debian\"\nbase_snapshot = \"my-snap\"\n",
     )
     .unwrap();
 
@@ -200,7 +200,7 @@ fn start_creates_sandbox() {
     make_workspace(rootdir, "feature");
     fs::write(
         rootdir.join("feature").join(".sodagun.toml"),
-        "[sandbox]\nimage = \"debian\"\n",
+        "[image]\nbase_image = \"debian\"\n",
     )
     .unwrap();
 

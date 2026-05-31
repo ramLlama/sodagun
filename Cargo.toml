@@ -20,6 +20,9 @@ toml         = "1"
 tokio        = { version = "1", features = ["rt-multi-thread", "time"] }
 uuid         = { version = "1", features = ["v4"] }
 colored      = "3"
+sha2         = "0"
+base64       = "0"
+hex          = "0"
 
 [[test]]
 name = "test_add_worktree"
@@ -32,6 +35,10 @@ path = "tests/integration/test_sandbox_start.rs"
 [[test]]
 name = "test_sandbox_lifecycle"
 path = "tests/integration/test_sandbox_lifecycle.rs"
+
+[[test]]
+name = "test_snapshot"
+path = "tests/integration/test_snapshot.rs"
 
 [dev-dependencies]
 assert_cmd = "2"

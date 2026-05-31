@@ -4421,14 +4421,17 @@ name = "sodagun"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "base64",
  "chrono",
  "clap",
  "colored",
  "git2",
+ "hex",
  "microsandbox",
  "predicates",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "toml",

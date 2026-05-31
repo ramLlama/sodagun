@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::config::NetworkMode;
+use crate::config::{ImageConfig, NetworkMode, SandboxConfig};
 use crate::context::{Context, OutputFormat};
 use crate::error::{SodagunError, handle_error};
 use crate::workspace::WorkspaceMetadata;
 use clap::{Parser, Subcommand};
 use microsandbox::sandbox::SandboxStatus;
-use microsandbox::{MicrosandboxError, NetworkPolicy, Sandbox};
+use microsandbox::{MicrosandboxError, NetworkPolicy, Sandbox, Snapshot};
 
 #[derive(Parser)]
 pub struct SandboxCommand {
@@ -162,12 +162,15 @@ fn start(ctx: Context, args: StartArgs) {
         .config
         .unwrap_or_else(|| meta.worktree_path.join(".sodagun.toml"));
 
-    let config = if !config_path.exists() && !explicit_config {
+    let (image_config, sandbox_config) = if !config_path.exists() && !explicit_config {
         // No config file present; use conservative defaults (alpine:latest, airgapped, etc.)
-        crate::config::default_config()
+        (
+            crate::config::default_image_config(),
+            crate::config::default_sandbox_config(),
+        )
     } else {
         match crate::config::load_config(&config_path) {
-            Ok(c) => c,
+            Ok(pair) => pair,
             Err(e) => handle_error(ctx, e),
         }
     };
@@ -198,7 +201,12 @@ fn start(ctx: Context, args: StartArgs) {
     }
 
     let rt = make_runtime(ctx);
-    let name = match rt.block_on(start_async(&sandbox_name, &meta.worktree_path, &config)) {
+    let name = match rt.block_on(start_async(
+        &sandbox_name,
+        &meta.worktree_path,
+        &image_config,
+        &sandbox_config,
+    )) {
         Ok(n) => n,
         Err(e) => {
             // Best-effort rollback: clear the name we reserved so the workspace is reusable
@@ -379,7 +387,7 @@ fn is_terminal_status(s: SandboxStatus) -> bool {
 
 /// Maps a microsandbox SDK error to a SodagunError, using SANDBOX_NOT_FOUND for
 /// unknown sandbox names and SANDBOX_ERROR for all other failures.
-fn map_sdk_err(e: MicrosandboxError, sandbox_name: &str) -> SodagunError {
+pub fn map_sandbox_sdk_err(e: MicrosandboxError, sandbox_name: &str) -> SodagunError {
     if matches!(e, MicrosandboxError::SandboxNotFound(_)) {
         SodagunError {
             code: "SANDBOX_NOT_FOUND",
@@ -396,10 +404,12 @@ fn map_sdk_err(e: MicrosandboxError, sandbox_name: &str) -> SodagunError {
 /// Polls `Sandbox::get` every 500ms until the sandbox reaches a terminal status
 /// (Stopped or Crashed), or until `timeout` elapses. Checks status before sleeping
 /// so fast-stopping sandboxes are detected immediately.
-async fn poll_until_stopped(name: &str, timeout: Duration) -> Result<(), SodagunError> {
+pub async fn poll_until_stopped(name: &str, timeout: Duration) -> Result<(), SodagunError> {
     let deadline = Instant::now() + timeout;
     loop {
-        let handle = Sandbox::get(name).await.map_err(|e| map_sdk_err(e, name))?;
+        let handle = Sandbox::get(name)
+            .await
+            .map_err(|e| map_sandbox_sdk_err(e, name))?;
         if is_terminal_status(handle.status()) {
             return Ok(());
         }
@@ -427,8 +437,10 @@ async fn list_async() -> Result<Vec<(String, String)>, SodagunError> {
         .collect())
 }
 
-async fn stop_async(name: &str, timeout: Duration, no_wait: bool) -> Result<(), SodagunError> {
-    let handle = Sandbox::get(name).await.map_err(|e| map_sdk_err(e, name))?;
+pub async fn stop_async(name: &str, timeout: Duration, no_wait: bool) -> Result<(), SodagunError> {
+    let handle = Sandbox::get(name)
+        .await
+        .map_err(|e| map_sandbox_sdk_err(e, name))?;
     // Already terminal — stop is a no-op.
     if is_terminal_status(handle.status()) {
         return Ok(());
@@ -443,8 +455,10 @@ async fn stop_async(name: &str, timeout: Duration, no_wait: bool) -> Result<(), 
     Ok(())
 }
 
-async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunError> {
-    let handle = Sandbox::get(name).await.map_err(|e| map_sdk_err(e, name))?;
+pub async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunError> {
+    let handle = Sandbox::get(name)
+        .await
+        .map_err(|e| map_sandbox_sdk_err(e, name))?;
 
     // Implicitly stop if still running before attempting removal.
     if !is_terminal_status(handle.status()) {
@@ -457,29 +471,48 @@ async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunError>
 
     Sandbox::remove(name)
         .await
-        .map_err(|e| map_sdk_err(e, name))
+        .map_err(|e| map_sandbox_sdk_err(e, name))
 }
 
 async fn start_async(
     sandbox_name: &str,
     worktree_path: &std::path::Path,
-    config: &crate::config::SandboxConfig,
+    image_config: &ImageConfig,
+    sandbox_config: &SandboxConfig,
 ) -> Result<String, SodagunError> {
     let mut builder = Sandbox::builder(sandbox_name);
 
-    // image and snapshot are mutually exclusive, already validated by load_config
-    if let Some(ref image) = config.image {
+    // Determine what to boot from. When a setup script is configured, we boot from
+    // the derived snapshot; the snapshot must already exist (run `sodagun snapshot create`).
+    if let Some(snap_name) = image_config.derived_snapshot_name() {
+        Snapshot::get(&snap_name).await.map_err(|e| {
+            if matches!(e, MicrosandboxError::SnapshotNotFound(_)) {
+                SodagunError {
+                    code: "SNAPSHOT_NOT_FOUND",
+                    message: format!(
+                        "snapshot '{snap_name}' not found — run 'sodagun snapshot create <rootdir>' first"
+                    ),
+                }
+            } else {
+                SodagunError {
+                    code: "SNAPSHOT_ERROR",
+                    message: format!("{e}"),
+                }
+            }
+        })?;
+        builder = builder.from_snapshot(&snap_name);
+    } else if let Some(ref image) = image_config.base_image {
         builder = builder.image(image.as_str());
-    } else if let Some(ref snapshot) = config.snapshot {
+    } else if let Some(ref snapshot) = image_config.base_snapshot {
         builder = builder.from_snapshot(snapshot.as_str());
     }
 
     builder = builder
-        .cpus(config.cpus)
-        .memory(config.memory_mb)
-        .workdir(&config.working_dir);
+        .cpus(sandbox_config.cpus)
+        .memory(sandbox_config.memory_mb)
+        .workdir(&sandbox_config.working_dir);
 
-    builder = match config.network.mode {
+    builder = match sandbox_config.network.mode {
         NetworkMode::Airgapped => builder.disable_network(),
         NetworkMode::AllowAll => builder.network(|b| b.policy(NetworkPolicy::allow_all())),
         NetworkMode::PublicOnly => builder.network(|b| b.policy(NetworkPolicy::public_only())),
@@ -490,10 +523,10 @@ async fn start_async(
         code: "CONFIG_INVALID",
         message: "worktree path contains non-UTF-8 characters".to_string(),
     })?;
-    builder = builder.volume(&config.working_dir, |m| m.bind(worktree_str));
+    builder = builder.volume(&sandbox_config.working_dir, |m| m.bind(worktree_str));
 
     // Additional volumes declared in config
-    for vol_str in &config.volumes {
+    for vol_str in &sandbox_config.volumes {
         let (host_path, guest_path, readonly) = parse_volume(vol_str)?;
         let host_str = host_path
             .to_str()
@@ -510,10 +543,15 @@ async fn start_async(
     }
 
     // Plain env vars
-    builder = builder.envs(config.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    builder = builder.envs(
+        sandbox_config
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
 
     // Secrets — resolve value_from_env at launch time
-    for (env_var, secret) in &config.secrets {
+    for (env_var, secret) in &sandbox_config.secrets {
         let value = if let Some(ref literal) = secret.value {
             literal.clone()
         } else if let Some(ref from_env) = secret.value_from_env {

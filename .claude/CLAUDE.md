@@ -77,21 +77,57 @@ Options:
 Text success: `"Removed."`
 JSON success: `{"status": "ok"}`
 
+### `snapshot create <rootdir>`
+
+Builds a deterministically named snapshot by running the `[image]` setup script inside an ephemeral sandbox, then snapshotting it. Snapshot name: `<sanitized-base>_<12-char-sha256>`. `sandbox launch` automatically boots from this snapshot when `[image]` is configured; it errors with a hint if the snapshot hasn't been created yet.
+
+Options:
+- `--config <path>` — config file path (default: `<rootdir>/.sodagun.toml`)
+- `--force` — recreate even if the snapshot already exists
+
+JSON success: `{"status": "ok", "snapshot_name": "...", "already_existed": false}`
+
+### `snapshot remove <name>`
+
+Removes a named snapshot via `Snapshot::remove(name)`.
+
+Options:
+- `-f` / `--force` — succeed silently if the snapshot does not exist
+
+JSON success: `{"status": "ok"}`
+
+### Snapshot error codes
+
+`CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `SNAPSHOT_NOT_FOUND`, `SNAPSHOT_ERROR`
+
+- `SNAPSHOT_NOT_FOUND` — named snapshot does not exist; emitted by `remove` (without `--force`)
+- `SNAPSHOT_ERROR` — SDK failure during ephemeral sandbox creation, script execution, snapshotting, or remove
+
 ### Sandbox error codes
 
 `WORKTREE_NOT_FOUND`, `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `SANDBOX_NOT_FOUND`, `SANDBOX_ERROR`
 
 - `WORKTREE_NOT_FOUND` — worktree path does not exist or is not a directory
 - `CONFIG_NOT_FOUND` — `.sodagun.toml` missing from the config path
-- `CONFIG_INVALID` — malformed TOML; missing `image`/`snapshot`; `image`+`snapshot` conflict; env/secret key conflict; invalid network mode; `cpus` out of `u8` range; bad volume format; `$HOME` not set for `~` expansion; unresolvable `value_from_env`; non-UTF-8 paths
+- `CONFIG_INVALID` — malformed TOML; missing `base_image`/`base_snapshot` in `[image]`; both set together; `setup_script`+`setup_script_path` conflict; env/secret key conflict; invalid network mode; `cpus` out of `u8` range; bad volume format; `$HOME` not set for `~` expansion; unresolvable `value_from_env`; non-UTF-8 paths
 - `SANDBOX_NOT_FOUND` — named sandbox does not exist (maps `MicrosandboxError::SandboxNotFound`); emitted by `stop`, `remove`
 - `SANDBOX_ERROR` — microsandbox SDK failure (runtime creation, `create_detached`, `start`, `attach_shell`, stop/remove ops, stop timeout)
 
 ### `.sodagun.toml` format
 
 ```toml
+[image]
+base_image = "debian"         # or base_snapshot = "name" (mutually exclusive; exactly one required)
+memory_mb = 512               # sandbox used during snapshot create; default
+cpus = 1                      # default; type u8
+setup_script = """
+#!/usr/bin/env bash
+set -e
+apt-get install -y git
+"""
+# setup_script_path = "./setup.sh"  # alternative to inline setup_script (mutually exclusive)
+
 [sandbox]
-image = "debian"            # or snapshot = "name" (mutually exclusive; exactly one required)
 working_dir = "/workspace"  # default
 memory_mb = 512             # default; type u32
 cpus = 1                    # default; type u8 (serde rejects values > 255 at parse time)
@@ -108,8 +144,14 @@ value_from_env = "ANTHROPIC_API_KEY"  # or: value = "literal"
 allowed_hosts = ["api.anthropic.com"]
 ```
 
+`[image]` key invariants:
+- Exactly one of `base_image` / `base_snapshot` is required; they are mutually exclusive
+- At most one of `setup_script` / `setup_script_path`; they are mutually exclusive
+- `setup_script_path` is resolved relative to the config file at load time
+- Snapshot name is `<sanitized-base>_<first-12-hex-chars-of-sha256(script)>`; deterministic given the same base+script
+
 Sandbox key invariants:
-- Exactly one of `image` / `snapshot` is required; they are mutually exclusive (validated in `load_config`)
+- `[image]` section is required; `[sandbox]` is optional (all fields have defaults)
 - A key may not appear in both `[sandbox.env]` and `[sandbox.secrets]` (validated in `load_config`)
 - Network mode maps to the SDK: `airgapped` → `disable_network()`, `allow-all` → `NetworkPolicy::allow_all()`, `public-only` → `NetworkPolicy::public_only()`
 - `cpus` is `u8` so serde rejects out-of-range values at parse time with `CONFIG_INVALID`
@@ -125,16 +167,18 @@ src/
   main.rs             # clap Cli struct, main(), dispatch
   context.rs          # OutputFormat (clap::ValueEnum, Default) + Context struct
   error.rs            # SodagunError (now #[derive(Debug)]), handle_error() -> !
-  config.rs           # .sodagun.toml parser; SandboxConfig, NetworkConfig, SecretConfig, NetworkMode, load_config()
+  config.rs           # .sodagun.toml parser; ImageConfig, SandboxConfig, NetworkConfig, SecretConfig, NetworkMode, load_config(), load_image_config()
   commands/
     mod.rs
     git.rs            # GitCommand sub-app; add_worktree logic
     sandbox.rs        # SandboxCommand sub-app; launch()/attach()/list()/stop()/remove() + async impls, parse_volume(), poll_until_stopped(), map_sdk_err(), status_label()
+    snapshot.rs       # SnapshotCommand sub-app; create()/remove() + async impls, derived_snapshot_name()
 tests/
   integration/
     test_add_worktree.rs       # registered via [[test]] in Cargo.toml
-    test_sandbox_launch.rs     # registered via [[test]] in Cargo.toml
+    test_sandbox_start.rs      # registered via [[test]] in Cargo.toml
     test_sandbox_lifecycle.rs  # registered via [[test]] in Cargo.toml
+    test_snapshot.rs           # registered via [[test]] in Cargo.toml
 Cargo.toml
 deny.toml             # cargo-deny policy (permissive license allowances + microsandbox advisory ignores)
 Makefile
@@ -172,14 +216,15 @@ make install    # cargo install --path .
 - `tests/integration/test_add_worktree.rs` -- end-to-end tests that invoke the compiled binary via `assert_cmd::Command::cargo_bin("sodagun")`; registered via `[[test]]` in `Cargo.toml` so the `tests/integration/` layout works (Cargo's default discovery only picks up files directly under `tests/`)
 - Integration helper `make_git_repo()` does `init_repository`, creates one commit, and writes a `refs/remotes/origin/main` ref so `--base origin/main` resolves out of the box
 - Unit tests live in `#[cfg(test)]` modules inside `src/commands/git.rs` and cover the pure naming contract (e.g. worktree path construction); no mocking layer for `git2`
-- `tests/integration/test_sandbox_launch.rs` -- 6 error-path tests (CONFIG_NOT_FOUND, malformed TOML, image/snapshot conflict, each in text + json) plus `launch_creates_sandbox`, which is `#[ignore]`d (reason: "requires KVM or Apple Silicon hvf, and a valid image") since it needs hardware virtualization
+- `tests/integration/test_sandbox_start.rs` -- error-path tests (CONFIG_NOT_FOUND, malformed TOML, `[image]` validation errors, each in text + json) plus `launch_creates_sandbox`, which is `#[ignore]`d (reason: "requires KVM or Apple Silicon hvf, and a valid image") since it needs hardware virtualization
 - `tests/integration/test_sandbox_lifecycle.rs` -- list (JSON shape + text header), stop/remove SANDBOX_NOT_FOUND (text + json each), plus two `#[ignore]`d happy-path tests (stop running sandbox, remove running sandbox with implicit stop)
-- `src/config.rs` has 16 `#[cfg(test)]` unit tests covering valid configs, defaults, and every `CONFIG_INVALID` / `CONFIG_NOT_FOUND` path; `parse_volume` unit tests live in `src/commands/sandbox.rs`
+- `tests/integration/test_snapshot.rs` -- all `[image]` error paths (CONFIG_NOT_FOUND, malformed TOML, missing base, conflicting fields), plus `#[ignore]`d e2e happy-path test that installs git via setup script and asserts `git version` succeeds in a sandbox booted from the resulting snapshot
+- `src/config.rs` has `#[cfg(test)]` unit tests covering valid `[image]` configs, defaults, and every `CONFIG_INVALID` / `CONFIG_NOT_FOUND` path; `parse_volume` unit tests live in `src/commands/sandbox.rs`
 - Volume tilde tests in `src/config.rs` assert `~` is preserved (not expanded) at parse time; `sandbox.rs` tests cover the launch-time expansion (and the `$HOME`-unset error path, which mutates the env var)
 
 ## Dependencies
 
-Runtime: `clap` (derive), `git2` (`vendored-libgit2`), `microsandbox` (0.4), `serde` + `serde_json`, `toml`, `tokio` (`rt-multi-thread`, `time`), `uuid` (v4), `colored`
+Runtime: `clap` (derive), `git2` (`vendored-libgit2`), `microsandbox` (0.4), `serde` + `serde_json`, `toml`, `tokio` (`rt-multi-thread`, `time`), `uuid` (v4), `colored`, `sha2`, `base64`, `hex`
 Dev: `assert_cmd`, `predicates`, `tempfile`
 Supply chain: `cargo-deny` + `cargo-audit` wired into pre-commit and `make audit`; `Cargo.lock` is committed. `deny.toml` allows additional permissive licenses (ISC, BSD-3-Clause, 0BSD, CDLA-Permissive-2.0, etc.) and ignores specific advisories pulled in by `microsandbox` transitive deps; `make audit` mirrors those ignores with `--ignore` flags
 

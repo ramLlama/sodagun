@@ -8,6 +8,7 @@ mod workspace;
 
 use commands::git::GitCommand;
 use commands::sandbox::SandboxCommand;
+use commands::snapshot::SnapshotCommand;
 use context::{Context, OutputFormat};
 
 #[derive(Parser)]
@@ -33,6 +34,8 @@ enum Commands {
     Git(GitCommand),
     /// Sandbox utilities.
     Sandbox(SandboxCommand),
+    /// Snapshot utilities.
+    Snapshot(SnapshotCommand),
 }
 
 fn main() {
@@ -42,5 +45,6 @@ fn main() {
     match cli.command {
         Commands::Git(cmd) => commands::git::run(ctx, cmd),
         Commands::Sandbox(cmd) => commands::sandbox::run(ctx, cmd),
+        Commands::Snapshot(cmd) => commands::snapshot::run(ctx, cmd),
     }
 }
