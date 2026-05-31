@@ -1,14 +1,13 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
-use microsandbox::sandbox::SandboxStatus;
-use microsandbox::{MicrosandboxError, NetworkPolicy, Sandbox};
-use uuid::Uuid;
-
 use crate::config::NetworkMode;
 use crate::context::{Context, OutputFormat};
 use crate::error::{SodagunError, handle_error};
+use crate::workspace::WorkspaceMetadata;
+use clap::{Parser, Subcommand};
+use microsandbox::sandbox::SandboxStatus;
+use microsandbox::{MicrosandboxError, NetworkPolicy, Sandbox};
 
 #[derive(Parser)]
 pub struct SandboxCommand {
@@ -18,8 +17,8 @@ pub struct SandboxCommand {
 
 #[derive(Subcommand)]
 pub enum SandboxSubcommand {
-    /// Launch a sandbox for a worktree.
-    Launch(LaunchArgs),
+    /// Start a sandbox for a worktree.
+    Start(StartArgs),
     /// Attach an interactive TTY session to a running sandbox.
     Attach(AttachArgs),
     /// List all sandboxes and their statuses.
@@ -31,9 +30,9 @@ pub enum SandboxSubcommand {
 }
 
 #[derive(Parser)]
-pub struct LaunchArgs {
-    /// Path to the worktree to mount at the configured working_dir.
-    pub worktree_path: PathBuf,
+pub struct StartArgs {
+    /// Workspace rootdir created by `git add-worktree`.
+    pub rootdir: PathBuf,
 
     /// Path to the sodagun config file (default: <worktree-path>/.sodagun.toml).
     #[arg(long)]
@@ -42,8 +41,8 @@ pub struct LaunchArgs {
 
 #[derive(Parser)]
 pub struct AttachArgs {
-    /// Name of the sandbox to attach to.
-    pub sandbox_name: String,
+    /// Workspace rootdir of the sandbox to attach to.
+    pub rootdir: PathBuf,
 }
 
 #[derive(Parser)]
@@ -51,8 +50,8 @@ pub struct ListArgs {}
 
 #[derive(Parser)]
 pub struct StopArgs {
-    /// Name of the sandbox to stop.
-    pub sandbox_name: String,
+    /// Workspace rootdir of the sandbox to stop.
+    pub rootdir: PathBuf,
 
     /// Seconds to wait for the sandbox to reach stopped state (default: 30).
     #[arg(long, default_value_t = 30)]
@@ -65,8 +64,8 @@ pub struct StopArgs {
 
 #[derive(Parser)]
 pub struct RemoveArgs {
-    /// Name of the sandbox to remove.
-    pub sandbox_name: String,
+    /// Workspace rootdir of the sandbox to remove.
+    pub rootdir: PathBuf,
 
     /// Seconds to wait for the sandbox to stop before removing (default: 30).
     #[arg(long, default_value_t = 30)]
@@ -75,12 +74,30 @@ pub struct RemoveArgs {
 
 pub fn run(ctx: Context, cmd: SandboxCommand) {
     match cmd.subcommand {
-        SandboxSubcommand::Launch(args) => launch(ctx, args),
+        SandboxSubcommand::Start(args) => start(ctx, args),
         SandboxSubcommand::Attach(args) => attach(ctx, args),
         SandboxSubcommand::List(args) => list(ctx, args),
         SandboxSubcommand::Stop(args) => stop(ctx, args),
         SandboxSubcommand::Remove(args) => remove(ctx, args),
     }
+}
+
+/// Read the sandbox name from a workspace's sodagun.json, exiting with the
+/// appropriate error code if the workspace is missing or has no sandbox started.
+fn read_sandbox_name(ctx: Context, rootdir: &std::path::Path) -> String {
+    let meta = WorkspaceMetadata::read(rootdir).unwrap_or_else(|e| handle_error(ctx, e));
+    meta.sandbox_name.unwrap_or_else(|| {
+        handle_error(
+            ctx,
+            SodagunError {
+                code: "SANDBOX_NOT_STARTED",
+                message: format!(
+                    "no sandbox has been started for this workspace: {}",
+                    rootdir.display()
+                ),
+            },
+        )
+    })
 }
 
 fn make_runtime(ctx: Context) -> tokio::runtime::Runtime {
@@ -96,15 +113,29 @@ fn make_runtime(ctx: Context) -> tokio::runtime::Runtime {
     }
 }
 
-fn launch(ctx: Context, args: LaunchArgs) {
-    if !args.worktree_path.is_dir() {
+fn start(ctx: Context, args: StartArgs) {
+    let meta = WorkspaceMetadata::read(&args.rootdir).unwrap_or_else(|e| handle_error(ctx, e));
+
+    if let Some(ref name) = meta.sandbox_name {
+        handle_error(
+            ctx,
+            SodagunError {
+                code: "SANDBOX_ALREADY_STARTED",
+                message: format!(
+                    "sandbox '{name}' is already started for this workspace; stop or remove it first"
+                ),
+            },
+        );
+    }
+
+    if !meta.worktree_path.is_dir() {
         handle_error(
             ctx,
             SodagunError {
                 code: "WORKTREE_NOT_FOUND",
                 message: format!(
                     "worktree path does not exist or is not a directory: {}",
-                    args.worktree_path.display()
+                    meta.worktree_path.display()
                 ),
             },
         );
@@ -113,7 +144,7 @@ fn launch(ctx: Context, args: LaunchArgs) {
     let explicit_config = args.config.is_some();
     let config_path = args
         .config
-        .unwrap_or_else(|| args.worktree_path.join(".sodagun.toml"));
+        .unwrap_or_else(|| meta.worktree_path.join(".sodagun.toml"));
 
     let config = if !config_path.exists() && !explicit_config {
         // No config file present; use conservative defaults (alpine:latest, airgapped, etc.)
@@ -125,19 +156,39 @@ fn launch(ctx: Context, args: LaunchArgs) {
         }
     };
 
-    // Name: sodagun-sb-{worktree_dirname}-{uuid8}
-    let dir_name = args
-        .worktree_path
+    // Sandbox name == rootdir directory name, enforcing a strict 1:1 worktree↔VM mapping.
+    let sandbox_name = args
+        .rootdir
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("sandbox");
-    let uuid_str = Uuid::new_v4().to_string().replace('-', "");
-    let sandbox_name = format!("sodagun-sb-{}-{}", dir_name, &uuid_str[..8]);
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            handle_error(
+                ctx,
+                SodagunError {
+                    code: "WORKSPACE_INVALID",
+                    message: format!(
+                        "workspace rootdir has no directory name: {}",
+                        args.rootdir.display()
+                    ),
+                },
+            )
+        });
+
+    // Reserve the sandbox name in metadata BEFORE launching. This way, if the process is
+    // interrupted after launch succeeds but before a post-launch write, the name is already
+    // persisted and the sandbox is still reachable. If launch fails, we clear it as rollback.
+    if let Err(e) = WorkspaceMetadata::set_sandbox_name(&args.rootdir, Some(sandbox_name.clone())) {
+        handle_error(ctx, e);
+    }
 
     let rt = make_runtime(ctx);
-    let name = match rt.block_on(launch_async(&sandbox_name, &args.worktree_path, &config)) {
+    let name = match rt.block_on(start_async(&sandbox_name, &meta.worktree_path, &config)) {
         Ok(n) => n,
-        Err(e) => handle_error(ctx, e),
+        Err(e) => {
+            // Best-effort rollback: clear the name we reserved so the workspace is reusable
+            let _ = WorkspaceMetadata::set_sandbox_name(&args.rootdir, None);
+            handle_error(ctx, e)
+        }
     };
 
     match ctx.output {
@@ -152,8 +203,10 @@ fn launch(ctx: Context, args: LaunchArgs) {
 }
 
 fn attach(ctx: Context, args: AttachArgs) {
+    let sandbox_name = read_sandbox_name(ctx, &args.rootdir);
+
     let rt = make_runtime(ctx);
-    match rt.block_on(attach_async(&args.sandbox_name)) {
+    match rt.block_on(attach_async(&sandbox_name)) {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(e) => handle_error(ctx, e),
     }
@@ -193,9 +246,11 @@ fn list(ctx: Context, _args: ListArgs) {
 }
 
 fn stop(ctx: Context, args: StopArgs) {
+    let sandbox_name = read_sandbox_name(ctx, &args.rootdir);
+
     let rt = make_runtime(ctx);
     let timeout = Duration::from_secs(args.stop_timeout_seconds);
-    match rt.block_on(stop_async(&args.sandbox_name, timeout, args.no_wait)) {
+    match rt.block_on(stop_async(&sandbox_name, timeout, args.no_wait)) {
         Ok(()) => {}
         Err(e) => handle_error(ctx, e),
     }
@@ -213,11 +268,18 @@ fn stop(ctx: Context, args: StopArgs) {
 }
 
 fn remove(ctx: Context, args: RemoveArgs) {
+    let sandbox_name = read_sandbox_name(ctx, &args.rootdir);
+
     let rt = make_runtime(ctx);
     let timeout = Duration::from_secs(args.stop_timeout_seconds);
-    match rt.block_on(remove_async(&args.sandbox_name, timeout)) {
+    match rt.block_on(remove_async(&sandbox_name, timeout)) {
         Ok(()) => {}
         Err(e) => handle_error(ctx, e),
+    }
+
+    // Clear sandbox_name now that the sandbox has been removed
+    if let Err(e) = WorkspaceMetadata::set_sandbox_name(&args.rootdir, None) {
+        handle_error(ctx, e);
     }
 
     match ctx.output {
@@ -350,7 +412,7 @@ async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunError>
         .map_err(|e| map_sdk_err(e, name))
 }
 
-async fn launch_async(
+async fn start_async(
     sandbox_name: &str,
     worktree_path: &std::path::Path,
     config: &crate::config::SandboxConfig,

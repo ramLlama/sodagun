@@ -1,8 +1,43 @@
+use std::fs;
+use std::path::Path;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn sodagun() -> Command {
     Command::cargo_bin("sodagun").unwrap()
+}
+
+/// Creates a minimal workspace with sandbox_name set to null.
+fn make_workspace(rootdir: &Path, branch: &str) {
+    fs::create_dir_all(rootdir).unwrap();
+    let worktree = rootdir.join(branch);
+    fs::create_dir(&worktree).unwrap();
+    let meta = serde_json::json!({
+        "version": 1,
+        "repo_path": "/test/repo",
+        "branch": branch,
+        "created_at": "2026-01-01T00:00:00Z",
+        "worktree_path": worktree.to_str().unwrap(),
+        "sandbox_name": null
+    });
+    fs::write(rootdir.join("sodagun.json"), meta.to_string()).unwrap();
+}
+
+/// Creates a workspace with sandbox_name already set (simulates a launched sandbox).
+fn make_workspace_with_sandbox(rootdir: &Path, branch: &str, sandbox_name: &str) {
+    fs::create_dir_all(rootdir).unwrap();
+    let worktree = rootdir.join(branch);
+    fs::create_dir(&worktree).unwrap();
+    let meta = serde_json::json!({
+        "version": 1,
+        "repo_path": "/test/repo",
+        "branch": branch,
+        "created_at": "2026-01-01T00:00:00Z",
+        "worktree_path": worktree.to_str().unwrap(),
+        "sandbox_name": sandbox_name
+    });
+    fs::write(rootdir.join("sodagun.json"), meta.to_string()).unwrap();
 }
 
 // --- sandbox list ---
@@ -27,12 +62,80 @@ fn list_text_prints_header() {
         .stdout(predicate::str::contains("STATUS"));
 }
 
-// --- sandbox stop: SANDBOX_NOT_FOUND ---
+// --- sandbox stop: WORKSPACE_NOT_FOUND ---
 
 #[test]
-fn stop_not_found_text() {
+fn stop_workspace_not_found_text() {
     sodagun()
-        .args(["sandbox", "stop", "sodagun-sb-nonexistent-00000000"])
+        .args(["sandbox", "stop", "/nonexistent/rootdir"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("WORKSPACE_NOT_FOUND"));
+}
+
+#[test]
+fn stop_workspace_not_found_json() {
+    sodagun()
+        .args([
+            "--output",
+            "json",
+            "sandbox",
+            "stop",
+            "/nonexistent/rootdir",
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("WORKSPACE_NOT_FOUND"));
+}
+
+// --- sandbox stop: SANDBOX_NOT_STARTED (sandbox_name is null) ---
+
+#[test]
+fn stop_not_started_text() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    make_workspace(&rootdir, "feature");
+
+    sodagun()
+        .args(["sandbox", "stop", rootdir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("SANDBOX_NOT_STARTED"));
+}
+
+#[test]
+fn stop_not_started_json() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    make_workspace(&rootdir, "feature");
+
+    sodagun()
+        .args([
+            "--output",
+            "json",
+            "sandbox",
+            "stop",
+            rootdir.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("SANDBOX_NOT_STARTED"));
+}
+
+// --- sandbox stop: SANDBOX_NOT_FOUND (sandbox_name set but sandbox doesn't exist) ---
+
+#[test]
+fn stop_sandbox_not_found_text() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    make_workspace_with_sandbox(&rootdir, "feature", "sodagun-nonexistent-00000000");
+
+    sodagun()
+        .args(["sandbox", "stop", rootdir.to_str().unwrap()])
         .assert()
         .failure()
         .code(1)
@@ -40,14 +143,18 @@ fn stop_not_found_text() {
 }
 
 #[test]
-fn stop_not_found_json() {
+fn stop_sandbox_not_found_json() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    make_workspace_with_sandbox(&rootdir, "feature", "sodagun-nonexistent-00000000");
+
     sodagun()
         .args([
             "--output",
             "json",
             "sandbox",
             "stop",
-            "sodagun-sb-nonexistent-00000000",
+            rootdir.to_str().unwrap(),
         ])
         .assert()
         .failure()
@@ -55,12 +162,80 @@ fn stop_not_found_json() {
         .stdout(predicate::str::contains("SANDBOX_NOT_FOUND"));
 }
 
+// --- sandbox remove: WORKSPACE_NOT_FOUND ---
+
+#[test]
+fn remove_workspace_not_found_text() {
+    sodagun()
+        .args(["sandbox", "remove", "/nonexistent/rootdir"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("WORKSPACE_NOT_FOUND"));
+}
+
+#[test]
+fn remove_workspace_not_found_json() {
+    sodagun()
+        .args([
+            "--output",
+            "json",
+            "sandbox",
+            "remove",
+            "/nonexistent/rootdir",
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("WORKSPACE_NOT_FOUND"));
+}
+
+// --- sandbox remove: SANDBOX_NOT_STARTED ---
+
+#[test]
+fn remove_not_started_text() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    make_workspace(&rootdir, "feature");
+
+    sodagun()
+        .args(["sandbox", "remove", rootdir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("SANDBOX_NOT_STARTED"));
+}
+
+#[test]
+fn remove_not_started_json() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    make_workspace(&rootdir, "feature");
+
+    sodagun()
+        .args([
+            "--output",
+            "json",
+            "sandbox",
+            "remove",
+            rootdir.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stdout(predicate::str::contains("SANDBOX_NOT_STARTED"));
+}
+
 // --- sandbox remove: SANDBOX_NOT_FOUND ---
 
 #[test]
-fn remove_not_found_text() {
+fn remove_sandbox_not_found_text() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    make_workspace_with_sandbox(&rootdir, "feature", "sodagun-nonexistent-00000000");
+
     sodagun()
-        .args(["sandbox", "remove", "sodagun-sb-nonexistent-00000000"])
+        .args(["sandbox", "remove", rootdir.to_str().unwrap()])
         .assert()
         .failure()
         .code(1)
@@ -68,14 +243,18 @@ fn remove_not_found_text() {
 }
 
 #[test]
-fn remove_not_found_json() {
+fn remove_sandbox_not_found_json() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    make_workspace_with_sandbox(&rootdir, "feature", "sodagun-nonexistent-00000000");
+
     sodagun()
         .args([
             "--output",
             "json",
             "sandbox",
             "remove",
-            "sodagun-sb-nonexistent-00000000",
+            rootdir.to_str().unwrap(),
         ])
         .assert()
         .failure()
@@ -86,67 +265,54 @@ fn remove_not_found_json() {
 // --- Happy-path tests (require KVM / Apple Silicon hvf) ---
 
 #[test]
-#[ignore = "requires KVM or Apple Silicon hvf, and a valid image"]
 fn stop_running_sandbox() {
-    use std::fs;
-    use tempfile::TempDir;
-
-    let tmp = TempDir::new().unwrap();
-    let worktree = tmp.path().join("worktree");
-    fs::create_dir(&worktree).unwrap();
-
-    // Launch and capture the sandbox name
-    let output = sodagun()
-        .args([
-            "--output",
-            "json",
-            "sandbox",
-            "launch",
-            worktree.to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let name = json["sandbox_name"].as_str().unwrap();
+    // Use tmp.path() directly as the rootdir so the sandbox name is the unique tmpXXX
+    // dirname rather than a hardcoded "workspace" that collides across concurrent runs.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rootdir = tmp.path();
+    make_workspace(rootdir, "feature");
+    fs::write(
+        rootdir.join("feature").join(".sodagun.toml"),
+        "[sandbox]\nimage = \"debian\"\n",
+    )
+    .unwrap();
 
     sodagun()
-        .args(["sandbox", "stop", name])
+        .args(["sandbox", "start", rootdir.to_str().unwrap()])
+        .assert()
+        .success();
+
+    sodagun()
+        .args(["sandbox", "stop", rootdir.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Stopped."));
+
+    // Clean up so the stopped (but not removed) sandbox doesn't linger across runs.
+    sodagun()
+        .args(["sandbox", "remove", rootdir.to_str().unwrap()])
+        .assert()
+        .success();
 }
 
 #[test]
-#[ignore = "requires KVM or Apple Silicon hvf, and a valid image"]
 fn remove_running_sandbox_implicit_stop() {
-    use std::fs;
-    use tempfile::TempDir;
-
-    let tmp = TempDir::new().unwrap();
-    let worktree = tmp.path().join("worktree");
-    fs::create_dir(&worktree).unwrap();
-
-    let output = sodagun()
-        .args([
-            "--output",
-            "json",
-            "sandbox",
-            "launch",
-            worktree.to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let name = json["sandbox_name"].as_str().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rootdir = tmp.path();
+    make_workspace(rootdir, "feature");
+    fs::write(
+        rootdir.join("feature").join(".sodagun.toml"),
+        "[sandbox]\nimage = \"debian\"\n",
+    )
+    .unwrap();
 
     sodagun()
-        .args(["sandbox", "remove", name])
+        .args(["sandbox", "start", rootdir.to_str().unwrap()])
+        .assert()
+        .success();
+
+    sodagun()
+        .args(["sandbox", "remove", rootdir.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Removed."));

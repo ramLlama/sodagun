@@ -10,6 +10,7 @@ name = "sodagun"
 path = "src/main.rs"
 
 [dependencies]
+chrono       = { version = "0.4", features = ["clock"] }
 clap         = { version = "4", features = ["derive"] }
 git2         = { version = "0.20", features = ["vendored-libgit2"] }
 microsandbox = "0.4"
@@ -25,8 +26,8 @@ name = "test_add_worktree"
 path = "tests/integration/test_add_worktree.rs"
 
 [[test]]
-name = "test_sandbox_launch"
-path = "tests/integration/test_sandbox_launch.rs"
+name = "test_sandbox_start"
+path = "tests/integration/test_sandbox_start.rs"
 
 [[test]]
 name = "test_sandbox_lifecycle"

@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod context;
 mod error;
+mod workspace;
 
 use commands::git::GitCommand;
 use commands::sandbox::SandboxCommand;

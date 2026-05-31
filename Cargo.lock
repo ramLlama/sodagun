@@ -4421,6 +4421,7 @@ name = "sodagun"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "chrono",
  "clap",
  "colored",
  "git2",

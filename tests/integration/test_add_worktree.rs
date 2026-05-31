@@ -58,7 +58,7 @@ fn workdir(repo: &Repository) -> PathBuf {
 // --- Success cases ---
 
 #[test]
-fn default_creates_worktree_under_tmp() {
+fn default_creates_workspace_under_tmp() {
     let tmp = TempDir::new().unwrap();
     let repo = make_git_repo(&tmp);
     let wd = workdir(&repo);
@@ -71,22 +71,44 @@ fn default_creates_worktree_under_tmp() {
         .stdout
         .clone();
 
-    let wt_path = PathBuf::from(String::from_utf8(output).unwrap().trim());
-    assert!(wt_path.exists(), "worktree path should exist on disk");
+    let rootdir = PathBuf::from(String::from_utf8(output).unwrap().trim());
+
+    // rootdir is under system temp dir and follows the naming convention
+    assert_eq!(
+        rootdir.parent().unwrap(),
+        std::env::temp_dir(),
+        "rootdir should be under system temp dir by default"
+    );
     assert!(
-        wt_path
+        rootdir
             .file_name()
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("sodagun-wt-repo-"),
-        "worktree name should start with sodagun-wt-repo-"
+            .starts_with("sodagun_repo_feature-a_"),
+        "rootdir name should follow sodagun_{{repo}}_{{branch}}_{{uuid8}} convention"
     );
-    assert_eq!(
-        wt_path.parent().unwrap(),
-        std::env::temp_dir(),
-        "worktree should be under system temp dir by default"
+
+    // worktree subdir exists inside rootdir
+    let worktree = rootdir.join("feature-a");
+    assert!(
+        worktree.is_dir(),
+        "worktree subdir should exist: {worktree:?}"
     );
+
+    // sodagun.json exists in rootdir
+    let metadata_path = rootdir.join("sodagun.json");
+    assert!(
+        metadata_path.exists(),
+        "sodagun.json should exist in rootdir"
+    );
+
+    // sodagun.json is valid and has expected fields
+    let raw = std::fs::read_to_string(&metadata_path).unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(meta["version"], 1);
+    assert_eq!(meta["branch"], "feature-a");
+    assert!(meta["sandbox_name"].is_null());
 }
 
 #[test]
@@ -112,17 +134,18 @@ fn custom_dir_prefix() {
         .stdout
         .clone();
 
-    let wt_path = PathBuf::from(String::from_utf8(output).unwrap().trim());
-    assert!(wt_path.exists());
-    assert_eq!(wt_path.parent().unwrap(), prefix);
+    let rootdir = PathBuf::from(String::from_utf8(output).unwrap().trim());
+    assert_eq!(rootdir.parent().unwrap(), prefix);
     assert!(
-        wt_path
+        rootdir
             .file_name()
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("sodagun-wt-repo-")
+            .starts_with("sodagun_repo_feature-b_")
     );
+    assert!(rootdir.join("feature-b").is_dir());
+    assert!(rootdir.join("sodagun.json").exists());
 }
 
 #[test]
@@ -148,8 +171,44 @@ fn json_success_output() {
 
     let data: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(data["status"], "ok");
-    let wt_path = PathBuf::from(data["worktree_path"].as_str().unwrap());
-    assert!(wt_path.exists());
+    let rootdir = PathBuf::from(data["rootdir"].as_str().unwrap());
+    assert!(rootdir.is_dir(), "rootdir should exist on disk");
+    assert!(
+        rootdir.join("feature-c").is_dir(),
+        "worktree subdir should exist"
+    );
+    assert!(
+        rootdir.join("sodagun.json").exists(),
+        "sodagun.json should exist"
+    );
+}
+
+#[test]
+fn branch_with_slash_sanitized_in_dir() {
+    let tmp = TempDir::new().unwrap();
+    let repo = make_git_repo(&tmp);
+    let wd = workdir(&repo);
+
+    let output = sodagun()
+        .args([
+            "git",
+            "add-worktree",
+            wd.to_str().unwrap(),
+            "feature/my-thing",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let rootdir = PathBuf::from(String::from_utf8(output).unwrap().trim());
+    // '/' in branch name becomes '-' in the worktree directory name
+    assert!(rootdir.join("feature-my-thing").is_dir());
+    // sodagun.json preserves the original branch name
+    let raw = std::fs::read_to_string(rootdir.join("sodagun.json")).unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(meta["branch"], "feature/my-thing");
 }
 
 // --- Error cases ---
