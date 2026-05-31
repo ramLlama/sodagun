@@ -4,7 +4,7 @@ use crate::config;
 use crate::context::{Context, OutputFormat};
 use crate::error::{SodagunError, handle_error};
 use clap::{Parser, Subcommand};
-use microsandbox::{MicrosandboxError, NetworkPolicy, Sandbox, Snapshot};
+use microsandbox::{ExecEvent, MicrosandboxError, NetworkPolicy, Sandbox, Snapshot};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -102,6 +102,7 @@ fn create(ctx: Context, args: CreateArgs) {
 
     let rt = make_runtime(ctx);
     let outcome = match rt.block_on(create_async(
+        ctx,
         &image_config,
         &script,
         &snapshot_name,
@@ -149,6 +150,7 @@ fn remove(ctx: Context, args: RemoveArgs) {
 }
 
 async fn create_async(
+    ctx: Context,
     image_config: &config::ImageConfig,
     script: &str,
     snapshot_name: &str,
@@ -202,21 +204,49 @@ async fn create_async(
         message: format!("failed to create ephemeral sandbox: {e}"),
     })?;
 
-    // Run the setup script and wait for completion.
-    let output = sandbox.shell("setup").await.map_err(|e| SodagunError {
-        code: "SNAPSHOT_ERROR",
-        message: format!("setup script failed to execute: {e}"),
-    })?;
+    // Run the setup script, streaming stdout/stderr to the user unless --quiet.
+    let mut handle = sandbox
+        .shell_stream("setup")
+        .await
+        .map_err(|e| SodagunError {
+            code: "SNAPSHOT_ERROR",
+            message: format!("setup script failed to execute: {e}"),
+        })?;
 
-    if !output.status().success {
+    // exit_code: None until Exited fires; Some(code) on completion.
+    let exit_code: i32 = loop {
+        match handle.recv().await {
+            Some(ExecEvent::Stdout(data)) => {
+                ctx.log(String::from_utf8_lossy(&data).trim_end_matches('\n'));
+            }
+            Some(ExecEvent::Stderr(data)) => {
+                ctx.log(String::from_utf8_lossy(&data).trim_end_matches('\n'));
+            }
+            Some(ExecEvent::Exited { code }) => break code,
+            Some(ExecEvent::Failed(payload)) => {
+                let _ = Sandbox::remove(&ephemeral_name).await;
+                return Err(SodagunError {
+                    code: "SNAPSHOT_ERROR",
+                    message: format!("setup script failed to spawn: {payload:?}"),
+                });
+            }
+            Some(_) => {}
+            None => {
+                let _ = Sandbox::remove(&ephemeral_name).await;
+                return Err(SodagunError {
+                    code: "SNAPSHOT_ERROR",
+                    message: "setup script exec session ended without exit event".to_string(),
+                });
+            }
+        }
+    };
+
+    if exit_code != 0 {
         // Best-effort cleanup before returning error.
         let _ = Sandbox::remove(&ephemeral_name).await;
         return Err(SodagunError {
             code: "SNAPSHOT_ERROR",
-            message: format!(
-                "setup script exited with non-zero status (code {})",
-                output.status().code
-            ),
+            message: format!("setup script exited with non-zero status (code {exit_code})"),
         });
     }
 
@@ -247,7 +277,9 @@ async fn create_async(
 
     // Best-effort removal of the ephemeral sandbox; warn but do not fail the command.
     if let Err(e) = Sandbox::remove(&ephemeral_name).await {
-        eprintln!("warning: failed to remove ephemeral sandbox '{ephemeral_name}': {e}");
+        ctx.warn(&format!(
+            "failed to remove ephemeral sandbox '{ephemeral_name}': {e}"
+        ));
     }
 
     Ok(CreateOutcome::Created)

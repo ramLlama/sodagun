@@ -24,6 +24,10 @@ struct Cli {
     #[arg(long, default_value = "text", value_enum)]
     output: OutputFormat,
 
+    /// Suppress progress output (setup script logs, etc.).
+    #[arg(long)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -40,7 +44,10 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    let ctx = Context { output: cli.output };
+    let ctx = Context {
+        output: cli.output,
+        quiet: cli.quiet,
+    };
 
     match cli.command {
         Commands::Git(cmd) => commands::git::run(ctx, cmd),
