@@ -1,5 +1,7 @@
 .PHONY: deps fmt fmt-check lint typecheck test audit build install uninstall clean all
 
+_default: all
+
 # Requires cargo-audit and cargo-deny: cargo install cargo-audit cargo-deny
 deps:
 	cargo fetch
@@ -43,4 +45,6 @@ uninstall:
 clean:
 	cargo clean
 
-all: fmt lint typecheck test audit
+check-all: fmt lint typecheck test audit
+
+all: check-all build
