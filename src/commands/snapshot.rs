@@ -19,6 +19,8 @@ pub enum SnapshotSubcommand {
     Create(CreateArgs),
     /// Remove a named snapshot.
     Remove(RemoveArgs),
+    /// Remove all snapshots associated with the current repo.
+    Clean(CleanArgs),
 }
 
 #[derive(Parser)]
@@ -43,10 +45,18 @@ pub struct RemoveArgs {
     pub force: bool,
 }
 
+#[derive(Parser)]
+pub struct CleanArgs {
+    /// Path to the config file (default: <project-dir>/.sodagun.toml).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+}
+
 pub fn run(ctx: Context, cmd: SnapshotCommand, project_dir: PathBuf) {
     match cmd.subcommand {
         SnapshotSubcommand::Create(args) => create(ctx, args, project_dir),
         SnapshotSubcommand::Remove(args) => remove(ctx, args, project_dir),
+        SnapshotSubcommand::Clean(args) => clean(ctx, args, project_dir),
     }
 }
 
@@ -97,12 +107,20 @@ fn create(ctx: Context, args: CreateArgs, project_dir: PathBuf) {
         .derived_snapshot_name()
         .expect("derived_snapshot_name is Some when setup_script is Some");
 
+    // Canonical repo path stored as a label so `snapshot clean` can filter by repo.
+    let repo_path = config_path
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
     let rt = make_runtime(ctx);
     let outcome = match rt.block_on(create_async(
         ctx,
         &image_config,
         &script,
         &snapshot_name,
+        &repo_path,
         args.force,
     )) {
         Ok(o) => o,
@@ -186,6 +204,7 @@ async fn create_async(
     image_config: &config::ImageConfig,
     script: &str,
     snapshot_name: &str,
+    repo_path: &str,
     force: bool,
 ) -> Result<CreateOutcome, SodagunError> {
     // Check whether the snapshot already exists.
@@ -330,9 +349,10 @@ async fn create_async(
 
     Snapshot::builder(&ephemeral_name)
         .name(snapshot_name)
+        .label("created_by", "sodagun")
+        .label("repo_path", repo_path)
         .label("setup_hash", setup_hash)
         .label("source_image", source_ref)
-        .label("created_by", "sodagun")
         .create()
         .await
         .map_err(|e| SodagunError {
@@ -348,6 +368,87 @@ async fn create_async(
     }
 
     Ok(CreateOutcome::Created)
+}
+
+fn clean(ctx: Context, args: CleanArgs, project_dir: PathBuf) {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| project_dir.join(".sodagun.toml"));
+
+    let repo_path = match config_path.parent().and_then(|p| p.canonicalize().ok()) {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => handle_error(
+            ctx,
+            SodagunError {
+                code: "CONFIG_INVALID",
+                message: "cannot canonicalize project directory".to_string(),
+            },
+        ),
+    };
+
+    let rt = make_runtime(ctx);
+    let removed = match rt.block_on(clean_async(ctx, &repo_path)) {
+        Ok(r) => r,
+        Err(e) => handle_error(ctx, e),
+    };
+
+    match ctx.output {
+        OutputFormat::Text => {
+            if removed.is_empty() {
+                println!("No snapshots to clean.");
+            } else {
+                for name in &removed {
+                    println!("Removed: {name}");
+                }
+            }
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({"status": "ok", "removed": removed})
+        ),
+    }
+}
+
+/// Lists all snapshots, opens each to read labels, removes those tagged with `repo_path`.
+async fn clean_async(ctx: Context, repo_path: &str) -> Result<Vec<String>, SodagunError> {
+    let handles = Snapshot::list().await.map_err(|e| SodagunError {
+        code: "SNAPSHOT_ERROR",
+        message: format!("failed to list snapshots: {e}"),
+    })?;
+
+    let mut removed = Vec::new();
+    for handle in handles {
+        let snapshot = match handle.open().await {
+            Ok(s) => s,
+            // Skip snapshots whose artifact is no longer on disk.
+            Err(_) => continue,
+        };
+
+        let labels = &snapshot.manifest().labels;
+        if labels.get("created_by").map(String::as_str) != Some("sodagun")
+            || labels.get("repo_path").map(String::as_str) != Some(repo_path)
+        {
+            continue;
+        }
+
+        // Prefer the name alias for removal; fall back to the content digest.
+        let id = handle
+            .name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| handle.digest().to_owned());
+
+        ctx.log(&format!("removing snapshot: {id}"));
+        Snapshot::remove(&id, false)
+            .await
+            .map_err(|e| SodagunError {
+                code: "SNAPSHOT_ERROR",
+                message: format!("failed to remove snapshot '{id}': {e}"),
+            })?;
+
+        removed.push(id);
+    }
+
+    Ok(removed)
 }
 
 async fn remove_async(name: &str, force: bool) -> Result<(), SodagunError> {
