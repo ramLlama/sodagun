@@ -12,12 +12,17 @@ fn sodagun() -> Command {
 /// Create a minimal workspace (rootdir + sodagun.json + worktree subdir) without
 /// needing a real git repo. Sufficient for config-error path tests.
 fn make_workspace(rootdir: &Path, branch: &str) {
+    make_workspace_with_repo(rootdir, Path::new("/test/repo"), branch);
+}
+
+/// Like `make_workspace` but with an explicit repo_path (for fallback config tests).
+fn make_workspace_with_repo(rootdir: &Path, repo_path: &Path, branch: &str) {
     fs::create_dir_all(rootdir).unwrap();
     let worktree = rootdir.join(branch);
     fs::create_dir(&worktree).unwrap();
     let meta = serde_json::json!({
         "version": 1,
-        "repo_path": "/test/repo",
+        "repo_path": repo_path.to_str().unwrap(),
         "branch": branch,
         "created_at": "2026-01-01T00:00:00Z",
         "worktree_path": worktree.to_str().unwrap(),
@@ -188,6 +193,55 @@ fn config_invalid_image_snapshot_conflict_json() {
         .failure()
         .code(1)
         .stdout(predicate::str::contains("CONFIG_INVALID"));
+}
+
+// --- Config resolution ---
+
+/// When the worktree has a .sodagun.toml, it takes precedence over the repo config.
+/// Verified by giving the worktree bad TOML (→ CONFIG_INVALID) while the repo has valid TOML.
+#[test]
+fn config_resolution_worktree_over_repo() {
+    let tmp = TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    make_workspace_with_repo(&rootdir, &repo, "feature");
+    fs::write(
+        rootdir.join("feature").join(".sodagun.toml"),
+        "not valid toml @@@@",
+    )
+    .unwrap();
+    fs::write(
+        repo.join(".sodagun.toml"),
+        "[image]\nbase_image = \"debian\"\n",
+    )
+    .unwrap();
+
+    sodagun()
+        .args(["sandbox", "start", rootdir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("CONFIG_INVALID"));
+}
+
+/// When the worktree has no .sodagun.toml, the repo config is used as a fallback.
+/// Verified by giving the repo bad TOML (→ CONFIG_INVALID) while the worktree has none.
+#[test]
+fn config_resolution_repo_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    make_workspace_with_repo(&rootdir, &repo, "feature");
+    fs::write(repo.join(".sodagun.toml"), "not valid toml @@@@").unwrap();
+
+    sodagun()
+        .args(["sandbox", "start", rootdir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("CONFIG_INVALID"));
 }
 
 // --- Full start test (requires KVM / Apple Silicon hardware virtualization) ---

@@ -158,22 +158,37 @@ fn start(ctx: Context, args: StartArgs) {
         );
     }
 
-    let explicit_config = args.config.is_some();
-    let config_path = args
-        .config
-        .unwrap_or_else(|| meta.worktree_path.join(".sodagun.toml"));
-
-    let (image_config, sandbox_config) = if !config_path.exists() && !explicit_config {
-        // No config file present; use conservative defaults (alpine:latest, airgapped, etc.)
-        (
-            crate::config::default_image_config(),
-            crate::config::default_sandbox_config(),
-        )
+    // Config resolution: explicit --config > worktree/.sodagun.toml > repo/.sodagun.toml > defaults.
+    // The fallback to repo_path lets branches that haven't added a per-branch config yet
+    // inherit the project-level config.
+    let resolved_config: Option<std::path::PathBuf> = if let Some(path) = args.config {
+        Some(path)
     } else {
-        match crate::config::load_config(&config_path) {
+        let worktree_toml = meta.worktree_path.join(".sodagun.toml");
+        let repo_toml = meta.repo_path.join(".sodagun.toml");
+        if worktree_toml.exists() {
+            Some(worktree_toml)
+        } else if repo_toml.exists() {
+            ctx.log(&format!(
+                "no .sodagun.toml in worktree; using project config from {}",
+                repo_toml.display()
+            ));
+            Some(repo_toml)
+        } else {
+            None
+        }
+    };
+
+    let (image_config, sandbox_config) = match resolved_config {
+        Some(path) => match crate::config::load_config(&path) {
             Ok(pair) => pair,
             Err(e) => handle_error(ctx, e),
-        }
+        },
+        // No config anywhere; use conservative defaults (alpine:latest, airgapped, etc.)
+        None => (
+            crate::config::default_image_config(),
+            crate::config::default_sandbox_config(),
+        ),
     };
 
     // Sandbox name == workspace directory name, enforcing a strict 1:1 worktree↔VM mapping.
@@ -205,6 +220,7 @@ fn start(ctx: Context, args: StartArgs) {
 
     let rt = make_runtime(ctx);
     let name = match rt.block_on(start_async(
+        ctx,
         &sandbox_name,
         &meta.worktree_path,
         &image_config,
@@ -478,6 +494,7 @@ pub async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunEr
 }
 
 async fn start_async(
+    ctx: Context,
     sandbox_name: &str,
     worktree_path: &std::path::Path,
     image_config: &ImageConfig,
@@ -503,10 +520,13 @@ async fn start_async(
                 }
             }
         })?;
+        ctx.log(&format!("booting from project snapshot: {snap_name}"));
         builder = builder.from_snapshot(&snap_name);
     } else if let Some(ref image) = image_config.base_image {
+        ctx.log(&format!("booting from image: {image}"));
         builder = builder.image(image.as_str());
     } else if let Some(ref snapshot) = image_config.base_snapshot {
+        ctx.log(&format!("booting from snapshot: {snapshot}"));
         builder = builder.from_snapshot(snapshot.as_str());
     }
 
