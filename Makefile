@@ -1,4 +1,4 @@
-.PHONY: deps fmt fmt-check lint typecheck test audit build install uninstall clean all
+.PHONY: deps fmt fmt-check lint typecheck test audit build-debug build-release-thin build-release install uninstall clean all
 
 _default: all
 
@@ -33,7 +33,13 @@ audit:
 		--ignore RUSTSEC-2026-0119 \
 		--ignore RUSTSEC-2023-0071
 
-build:
+build-debug:
+	cargo build
+
+build-release-thin:
+	cargo build --profile release-thin
+
+build-release:
 	cargo build --release
 
 install:
@@ -47,4 +53,4 @@ clean:
 
 check-all: fmt lint typecheck test audit
 
-all: check-all build
+all: check-all build-release-thin

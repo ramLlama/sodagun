@@ -45,3 +45,10 @@ path = "tests/integration/test_snapshot.rs"
 assert_cmd = "2"
 predicates = "3"
 tempfile   = "3"
+
+[profile.release]
+lto = true          # fat LTO for maximum size/speed
+
+[profile.release-thin]
+inherits = "release"
+lto = "thin"        # faster linking than fat LTO, still optimized
