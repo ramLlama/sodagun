@@ -45,6 +45,10 @@ pub struct StartArgs {
 pub struct AttachArgs {
     /// Workspace rootdir of the sandbox to attach to.
     pub workspace_path: PathBuf,
+
+    /// Skip login shell; attach without sourcing profile files.
+    #[arg(long)]
+    pub no_login: bool,
 }
 
 #[derive(Parser)]
@@ -58,6 +62,10 @@ pub struct ExecArgs {
     /// Arguments for the command.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
+
+    /// Skip login shell; run the command directly without sourcing profile files.
+    #[arg(long)]
+    pub no_login: bool,
 }
 
 #[derive(Parser)]
@@ -249,7 +257,7 @@ fn attach(ctx: Context, args: AttachArgs) {
     let sandbox_name = read_sandbox_name(ctx, &args.workspace_path);
 
     let rt = make_runtime(ctx);
-    match rt.block_on(attach_async(&sandbox_name)) {
+    match rt.block_on(attach_async(&sandbox_name, !args.no_login)) {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(e) => handle_error(ctx, e),
     }
@@ -259,7 +267,12 @@ fn exec(ctx: Context, args: ExecArgs) {
     let sandbox_name = read_sandbox_name(ctx, &args.workspace_path);
 
     let rt = make_runtime(ctx);
-    match rt.block_on(exec_async(&sandbox_name, &args.cmd, &args.args)) {
+    match rt.block_on(exec_async(
+        &sandbox_name,
+        &args.cmd,
+        &args.args,
+        !args.no_login,
+    )) {
         Ok(output) => {
             let exit_code = output.status().code;
             match ctx.output {
@@ -618,6 +631,7 @@ async fn exec_async(
     sandbox_name: &str,
     cmd: &str,
     args: &[String],
+    login: bool,
 ) -> Result<microsandbox::sandbox::ExecOutput, SodagunError> {
     let sandbox = Sandbox::start(sandbox_name)
         .await
@@ -626,18 +640,36 @@ async fn exec_async(
             message: format!("failed to connect to sandbox '{sandbox_name}': {e}"),
         })?;
 
-    sandbox
-        .exec(cmd, args.iter().map(String::as_str))
-        .await
-        .map_err(|e| SodagunError {
-            code: "SANDBOX_ERROR",
-            message: format!("exec failed in sandbox '{sandbox_name}': {e}"),
-        })
+    if login {
+        // Run via a login shell so profile files (and PATH) are sourced.
+        // `sh -l -c 'exec "$@"' sh <cmd> <args>` sources .profile then execs
+        // the real command, preserving argument quoting without shell-escaping.
+        let login_args: Vec<&str> = ["-l", "-c", "exec \"$@\"", "sh", cmd]
+            .iter()
+            .copied()
+            .chain(args.iter().map(String::as_str))
+            .collect();
+        sandbox
+            .exec("/bin/sh", login_args)
+            .await
+            .map_err(|e| SodagunError {
+                code: "SANDBOX_ERROR",
+                message: format!("exec failed in sandbox '{sandbox_name}': {e}"),
+            })
+    } else {
+        sandbox
+            .exec(cmd, args.iter().map(String::as_str))
+            .await
+            .map_err(|e| SodagunError {
+                code: "SANDBOX_ERROR",
+                message: format!("exec failed in sandbox '{sandbox_name}': {e}"),
+            })
+    }
 }
 
 /// Returns the shell's exit code on a normal interactive session end.
 /// Returns `Err` only on infrastructure failure (connection lost, etc.).
-async fn attach_async(sandbox_name: &str) -> Result<i32, SodagunError> {
+async fn attach_async(sandbox_name: &str, login: bool) -> Result<i32, SodagunError> {
     let sandbox = Sandbox::start(sandbox_name)
         .await
         .map_err(|e| SodagunError {
@@ -645,10 +677,20 @@ async fn attach_async(sandbox_name: &str) -> Result<i32, SodagunError> {
             message: format!("failed to connect to sandbox '{sandbox_name}': {e}"),
         })?;
 
-    sandbox.attach_shell().await.map_err(|e| SodagunError {
-        code: "SANDBOX_ERROR",
-        message: format!("attach session failed: {e}"),
-    })
+    if login {
+        sandbox
+            .attach("/bin/sh", ["-l"])
+            .await
+            .map_err(|e| SodagunError {
+                code: "SANDBOX_ERROR",
+                message: format!("attach session failed: {e}"),
+            })
+    } else {
+        sandbox.attach_shell().await.map_err(|e| SodagunError {
+            code: "SANDBOX_ERROR",
+            message: format!("attach session failed: {e}"),
+        })
+    }
 }
 
 #[cfg(test)]

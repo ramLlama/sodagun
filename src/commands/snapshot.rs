@@ -307,6 +307,12 @@ async fn create_async(
         });
     }
 
+    // Flush all pending guest writes so small files (page-cache dirty) aren't
+    // lost when the VM halts before the upper layer is snapshotted.
+    if let Err(e) = sandbox.exec("sync", std::iter::empty::<&str>()).await {
+        ctx.warn(&format!("sync before snapshot failed (continuing): {e}"));
+    }
+
     // Snapshots require a stopped sandbox.
     sandbox.stop_and_wait().await.map_err(|e| SodagunError {
         code: "SNAPSHOT_ERROR",
