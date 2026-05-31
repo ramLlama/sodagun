@@ -21,6 +21,8 @@ pub enum SandboxSubcommand {
     Start(StartArgs),
     /// Attach an interactive TTY session to a running sandbox.
     Attach(AttachArgs),
+    /// Run a command in a running sandbox and return its output.
+    Exec(ExecArgs),
     /// List all sandboxes and their statuses.
     List(ListArgs),
     /// Stop a running sandbox.
@@ -43,6 +45,19 @@ pub struct StartArgs {
 pub struct AttachArgs {
     /// Workspace rootdir of the sandbox to attach to.
     pub rootdir: PathBuf,
+}
+
+#[derive(Parser)]
+pub struct ExecArgs {
+    /// Workspace rootdir of the sandbox to exec into.
+    pub rootdir: PathBuf,
+
+    /// Command to run inside the sandbox.
+    pub cmd: String,
+
+    /// Arguments for the command.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
 }
 
 #[derive(Parser)]
@@ -76,6 +91,7 @@ pub fn run(ctx: Context, cmd: SandboxCommand) {
     match cmd.subcommand {
         SandboxSubcommand::Start(args) => start(ctx, args),
         SandboxSubcommand::Attach(args) => attach(ctx, args),
+        SandboxSubcommand::Exec(args) => exec(ctx, args),
         SandboxSubcommand::List(args) => list(ctx, args),
         SandboxSubcommand::Stop(args) => stop(ctx, args),
         SandboxSubcommand::Remove(args) => remove(ctx, args),
@@ -208,6 +224,38 @@ fn attach(ctx: Context, args: AttachArgs) {
     let rt = make_runtime(ctx);
     match rt.block_on(attach_async(&sandbox_name)) {
         Ok(exit_code) => std::process::exit(exit_code),
+        Err(e) => handle_error(ctx, e),
+    }
+}
+
+fn exec(ctx: Context, args: ExecArgs) {
+    let sandbox_name = read_sandbox_name(ctx, &args.rootdir);
+
+    let rt = make_runtime(ctx);
+    match rt.block_on(exec_async(&sandbox_name, &args.cmd, &args.args)) {
+        Ok(output) => {
+            let exit_code = output.status().code;
+            match ctx.output {
+                OutputFormat::Text => {
+                    // Write captured stdout/stderr to the corresponding streams.
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(output.stdout_bytes());
+                    let _ = std::io::stderr().write_all(output.stderr_bytes());
+                }
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "ok",
+                            "exit_code": exit_code,
+                            "stdout": output.stdout().unwrap_or_default(),
+                            "stderr": output.stderr().unwrap_or_default(),
+                        })
+                    );
+                }
+            }
+            std::process::exit(exit_code);
+        }
         Err(e) => handle_error(ctx, e),
     }
 }
@@ -503,6 +551,27 @@ async fn start_async(
     })?;
 
     Ok(sandbox.name().to_string())
+}
+
+async fn exec_async(
+    sandbox_name: &str,
+    cmd: &str,
+    args: &[String],
+) -> Result<microsandbox::sandbox::ExecOutput, SodagunError> {
+    let sandbox = Sandbox::start(sandbox_name)
+        .await
+        .map_err(|e| SodagunError {
+            code: "SANDBOX_ERROR",
+            message: format!("failed to connect to sandbox '{sandbox_name}': {e}"),
+        })?;
+
+    sandbox
+        .exec(cmd, args.iter().map(String::as_str))
+        .await
+        .map_err(|e| SodagunError {
+            code: "SANDBOX_ERROR",
+            message: format!("exec failed in sandbox '{sandbox_name}': {e}"),
+        })
 }
 
 /// Returns the shell's exit code on a normal interactive session end.
