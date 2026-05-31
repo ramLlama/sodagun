@@ -183,10 +183,18 @@ fn snapshot_create_no_setup_script_json() {
 
 // ── SNAPSHOT_NOT_FOUND: remove non-existent snapshot ──────────────────────────
 
+/// Config with a setup_script whose derived snapshot name won't exist.
+fn nonexistent_snapshot_dir() -> TempDir {
+    config_dir(
+        "[image]\nbase_image = \"alpine:latest\"\nsetup_script = \"#!/bin/sh\\necho nonexistent\\n\"\n",
+    )
+}
+
 #[test]
 fn snapshot_remove_not_found_text() {
+    let tmp = nonexistent_snapshot_dir();
     sodagun()
-        .args(["snapshot", "remove", "nonexistent-snapshot-name-xyz"])
+        .args(["snapshot", "remove", tmp.path().to_str().unwrap()])
         .assert()
         .failure()
         .code(1)
@@ -195,13 +203,14 @@ fn snapshot_remove_not_found_text() {
 
 #[test]
 fn snapshot_remove_not_found_json() {
+    let tmp = nonexistent_snapshot_dir();
     sodagun()
         .args([
             "--output",
             "json",
             "snapshot",
             "remove",
-            "nonexistent-snapshot-name-xyz",
+            tmp.path().to_str().unwrap(),
         ])
         .assert()
         .failure()
@@ -213,12 +222,13 @@ fn snapshot_remove_not_found_json() {
 
 #[test]
 fn snapshot_remove_force_nonexistent_succeeds() {
+    let tmp = nonexistent_snapshot_dir();
     sodagun()
         .args([
             "snapshot",
             "remove",
             "--force",
-            "nonexistent-snapshot-name-xyz",
+            tmp.path().to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -236,6 +246,12 @@ fn snapshot_create_and_idempotent() {
     );
     let tmp = config_dir(&toml);
     let rootdir = tmp.path().to_str().unwrap();
+
+    // Clear any stale snapshot from a previous run.
+    sodagun()
+        .args(["snapshot", "remove", "--force", rootdir])
+        .assert()
+        .success();
 
     // First create should succeed.
     let output = sodagun()
@@ -265,7 +281,7 @@ fn snapshot_create_and_idempotent() {
 
     // Clean up.
     sodagun()
-        .args(["snapshot", "remove", &snap_name])
+        .args(["snapshot", "remove", rootdir])
         .assert()
         .success()
         .stdout(predicate::str::contains("Removed."));
@@ -294,18 +310,8 @@ fn snapshot_create_force_recreates() {
         .success()
         .stdout(predicate::str::contains("Created snapshot:"));
 
-    // Extract snapshot name from JSON output to clean up.
-    let output = sodagun()
-        .args(["--output", "json", "snapshot", "create", rootdir])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let data: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let snap_name = data["snapshot_name"].as_str().unwrap();
     sodagun()
-        .args(["snapshot", "remove", snap_name])
+        .args(["snapshot", "remove", rootdir])
         .assert()
         .success();
 }
@@ -389,7 +395,7 @@ fn snapshot_setup_script_side_effects_persist() {
         .assert()
         .success();
     sodagun()
-        .args(["snapshot", "remove", &snap_name])
+        .args(["snapshot", "remove", snap_cfg.path().to_str().unwrap()])
         .assert()
         .success();
 }

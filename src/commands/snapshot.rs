@@ -38,8 +38,12 @@ pub struct CreateArgs {
 
 #[derive(Parser)]
 pub struct RemoveArgs {
-    /// Name of the snapshot to remove.
-    pub name: String,
+    /// Workspace rootdir containing .sodagun.toml.
+    pub rootdir: PathBuf,
+
+    /// Path to the config file (default: <rootdir>/.sodagun.toml).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
 
     /// Succeed silently even if the snapshot does not exist (like rm -f).
     #[arg(long, short = 'f')]
@@ -139,14 +143,49 @@ fn create(ctx: Context, args: CreateArgs) {
 }
 
 fn remove(ctx: Context, args: RemoveArgs) {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| args.rootdir.join(".sodagun.toml"));
+
+    let image_config = match config::load_image_config(&config_path) {
+        Ok(c) => c,
+        Err(e) => handle_error(ctx, e),
+    };
+
+    let snapshot_name = match image_config.derived_snapshot_name() {
+        Some(n) => n,
+        None => handle_error(
+            ctx,
+            SodagunError {
+                code: "CONFIG_INVALID",
+                message: "no setup_script or setup_script_path in [image] — nothing to remove"
+                    .to_string(),
+            },
+        ),
+    };
+
     let rt = make_runtime(ctx);
-    match rt.block_on(remove_async(&args.name, args.force)) {
+    match rt.block_on(remove_async(&snapshot_name, args.force)) {
         Ok(()) => match ctx.output {
             OutputFormat::Text => println!("Removed."),
             OutputFormat::Json => println!("{}", serde_json::json!({"status": "ok"})),
         },
         Err(e) => handle_error(ctx, e),
     }
+}
+
+/// Returns (memory_mb, cpus) sized for a fast snapshot build:
+/// half of total system RAM and all-but-two logical CPUs (minimum 1).
+fn snapshot_build_resources() -> (u32, u8) {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let memory_mb = (sys.total_memory() / 1_048_576 / 2) as u32;
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let cpus = cpus.saturating_sub(2).max(1) as u8;
+    (memory_mb, cpus)
 }
 
 async fn create_async(
@@ -192,11 +231,17 @@ async fn create_async(
         builder = builder.from_snapshot(snap.as_str());
     }
 
+    let (snap_memory_mb, snap_cpus) = snapshot_build_resources();
+    ctx.log(&format!(
+        "snapshot build resources: {snap_memory_mb} MiB RAM, {snap_cpus} CPUs"
+    ));
     builder = builder
-        .cpus(image_config.cpus)
-        .memory(image_config.memory_mb)
+        .cpus(snap_cpus)
+        .memory(snap_memory_mb)
         // Snapshot creation always uses full internet access for package installs.
         .network(|b| b.policy(NetworkPolicy::allow_all()))
+        // Give /tmp plenty of room for build artifacts (e.g. cargo compiling large C deps).
+        .volume("/tmp", |m| m.tmpfs().size(8192u32))
         .script("setup", script);
 
     let sandbox = builder.create().await.map_err(|e| SodagunError {

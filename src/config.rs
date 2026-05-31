@@ -37,8 +37,6 @@ pub struct SecretConfig {
 pub struct ImageConfig {
     pub base_image: Option<String>,
     pub base_snapshot: Option<String>,
-    pub memory_mb: u32,
-    pub cpus: u8,
     /// Resolved setup script content; `None` means no setup, boot base directly.
     pub setup_script: Option<String>,
 }
@@ -89,10 +87,6 @@ pub struct SandboxConfig {
 struct RawImageConfig {
     base_image: Option<String>,
     base_snapshot: Option<String>,
-    #[serde(default = "default_memory_mb")]
-    memory_mb: u32,
-    #[serde(default = "default_cpus")]
-    cpus: u8,
     setup_script: Option<String>,
     setup_script_path: Option<String>,
 }
@@ -133,8 +127,6 @@ pub fn default_image_config() -> ImageConfig {
     ImageConfig {
         base_image: Some("alpine:latest".to_string()),
         base_snapshot: None,
-        memory_mb: default_memory_mb(),
-        cpus: default_cpus(),
         setup_script: None,
     }
 }
@@ -240,8 +232,6 @@ fn validate_image_config(
     Ok(ImageConfig {
         base_image: raw.base_image,
         base_snapshot: raw.base_snapshot,
-        memory_mb: raw.memory_mb,
-        cpus: raw.cpus,
         setup_script,
     })
 }
