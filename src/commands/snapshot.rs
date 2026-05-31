@@ -24,10 +24,7 @@ pub enum SnapshotSubcommand {
 
 #[derive(Parser)]
 pub struct CreateArgs {
-    /// Workspace rootdir containing .sodagun.toml.
-    pub rootdir: PathBuf,
-
-    /// Path to the config file (default: <rootdir>/.sodagun.toml).
+    /// Path to the config file (default: <project-dir>/.sodagun.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -38,10 +35,7 @@ pub struct CreateArgs {
 
 #[derive(Parser)]
 pub struct RemoveArgs {
-    /// Workspace rootdir containing .sodagun.toml.
-    pub rootdir: PathBuf,
-
-    /// Path to the config file (default: <rootdir>/.sodagun.toml).
+    /// Path to the config file (default: <project-dir>/.sodagun.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -50,10 +44,10 @@ pub struct RemoveArgs {
     pub force: bool,
 }
 
-pub fn run(ctx: Context, cmd: SnapshotCommand) {
+pub fn run(ctx: Context, cmd: SnapshotCommand, project_dir: PathBuf) {
     match cmd.subcommand {
-        SnapshotSubcommand::Create(args) => create(ctx, args),
-        SnapshotSubcommand::Remove(args) => remove(ctx, args),
+        SnapshotSubcommand::Create(args) => create(ctx, args, project_dir),
+        SnapshotSubcommand::Remove(args) => remove(ctx, args, project_dir),
     }
 }
 
@@ -78,10 +72,10 @@ enum CreateOutcome {
     Created,
 }
 
-fn create(ctx: Context, args: CreateArgs) {
+fn create(ctx: Context, args: CreateArgs, project_dir: PathBuf) {
     let config_path = args
         .config
-        .unwrap_or_else(|| args.rootdir.join(".sodagun.toml"));
+        .unwrap_or_else(|| project_dir.join(".sodagun.toml"));
 
     let image_config = match config::load_image_config(&config_path) {
         Ok(c) => c,
@@ -142,10 +136,10 @@ fn create(ctx: Context, args: CreateArgs) {
     }
 }
 
-fn remove(ctx: Context, args: RemoveArgs) {
+fn remove(ctx: Context, args: RemoveArgs, project_dir: PathBuf) {
     let config_path = args
         .config
-        .unwrap_or_else(|| args.rootdir.join(".sodagun.toml"));
+        .unwrap_or_else(|| project_dir.join(".sodagun.toml"));
 
     let image_config = match config::load_image_config(&config_path) {
         Ok(c) => c,

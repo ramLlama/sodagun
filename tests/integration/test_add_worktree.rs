@@ -64,7 +64,13 @@ fn default_creates_workspace_under_tmp() {
     let wd = workdir(&repo);
 
     let output = sodagun()
-        .args(["git", "add-worktree", wd.to_str().unwrap(), "feature-a"])
+        .args([
+            "--project-dir",
+            wd.to_str().unwrap(),
+            "git",
+            "add-worktree",
+            "feature-a",
+        ])
         .assert()
         .success()
         .get_output()
@@ -121,9 +127,10 @@ fn custom_dir_prefix() {
 
     let output = sodagun()
         .args([
+            "--project-dir",
+            wd.to_str().unwrap(),
             "git",
             "add-worktree",
-            wd.to_str().unwrap(),
             "feature-b",
             "--dir-prefix",
             prefix.to_str().unwrap(),
@@ -156,11 +163,12 @@ fn json_success_output() {
 
     let output = sodagun()
         .args([
+            "--project-dir",
+            wd.to_str().unwrap(),
             "--output",
             "json",
             "git",
             "add-worktree",
-            wd.to_str().unwrap(),
             "feature-c",
         ])
         .assert()
@@ -191,9 +199,10 @@ fn branch_with_slash_sanitized_in_dir() {
 
     let output = sodagun()
         .args([
+            "--project-dir",
+            wd.to_str().unwrap(),
             "git",
             "add-worktree",
-            wd.to_str().unwrap(),
             "feature/my-thing",
         ])
         .assert()
@@ -216,7 +225,13 @@ fn branch_with_slash_sanitized_in_dir() {
 #[test]
 fn repo_not_found_text() {
     sodagun()
-        .args(["git", "add-worktree", "/nonexistent/path", "branch"])
+        .args([
+            "--project-dir",
+            "/nonexistent/path",
+            "git",
+            "add-worktree",
+            "branch",
+        ])
         .assert()
         .failure()
         .code(1)
@@ -227,11 +242,12 @@ fn repo_not_found_text() {
 fn repo_not_found_json() {
     let output = sodagun()
         .args([
+            "--project-dir",
+            "/nonexistent/path",
             "--output",
             "json",
             "git",
             "add-worktree",
-            "/nonexistent/path",
             "branch",
         ])
         .assert()
@@ -256,9 +272,10 @@ fn base_not_found() {
 
     sodagun()
         .args([
+            "--project-dir",
+            wd.to_str().unwrap(),
             "git",
             "add-worktree",
-            wd.to_str().unwrap(),
             "branch",
             "--base",
             "refs/heads/nonexistent",
@@ -277,11 +294,12 @@ fn base_not_found_json() {
 
     let output = sodagun()
         .args([
+            "--project-dir",
+            wd.to_str().unwrap(),
             "--output",
             "json",
             "git",
             "add-worktree",
-            wd.to_str().unwrap(),
             "branch",
             "--base",
             "refs/heads/nonexistent",
@@ -309,9 +327,10 @@ fn branch_already_exists() {
     // Create the branch so it already exists
     sodagun()
         .args([
+            "--project-dir",
+            wd.to_str().unwrap(),
             "git",
             "add-worktree",
-            wd.to_str().unwrap(),
             "existing-branch",
         ])
         .assert()
@@ -320,9 +339,10 @@ fn branch_already_exists() {
     // Now try to create it again (new worktree path, but same branch name)
     sodagun()
         .args([
+            "--project-dir",
+            wd.to_str().unwrap(),
             "git",
             "add-worktree",
-            wd.to_str().unwrap(),
             "existing-branch",
         ])
         .assert()
@@ -339,9 +359,10 @@ fn branch_already_exists_json() {
 
     sodagun()
         .args([
+            "--project-dir",
+            wd.to_str().unwrap(),
             "git",
             "add-worktree",
-            wd.to_str().unwrap(),
             "existing-branch-2",
         ])
         .assert()
@@ -349,11 +370,12 @@ fn branch_already_exists_json() {
 
     let output = sodagun()
         .args([
+            "--project-dir",
+            wd.to_str().unwrap(),
             "--output",
             "json",
             "git",
             "add-worktree",
-            wd.to_str().unwrap(),
             "existing-branch-2",
         ])
         .assert()

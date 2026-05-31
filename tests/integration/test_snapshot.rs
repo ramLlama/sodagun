@@ -37,7 +37,12 @@ fn make_workspace(rootdir: &Path, worktree_name: &str) {
 #[test]
 fn snapshot_create_config_not_found_text() {
     sodagun()
-        .args(["snapshot", "create", "/nonexistent/rootdir"])
+        .args([
+            "--project-dir",
+            "/nonexistent/rootdir",
+            "snapshot",
+            "create",
+        ])
         .assert()
         .failure()
         .code(1)
@@ -48,11 +53,12 @@ fn snapshot_create_config_not_found_text() {
 fn snapshot_create_config_not_found_json() {
     sodagun()
         .args([
+            "--project-dir",
+            "/nonexistent/rootdir",
             "--output",
             "json",
             "snapshot",
             "create",
-            "/nonexistent/rootdir",
         ])
         .assert()
         .failure()
@@ -66,7 +72,12 @@ fn snapshot_create_config_not_found_json() {
 fn snapshot_create_invalid_toml_text() {
     let tmp = config_dir("not valid toml @@@@");
     sodagun()
-        .args(["snapshot", "create", tmp.path().to_str().unwrap()])
+        .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
+            "snapshot",
+            "create",
+        ])
         .assert()
         .failure()
         .code(1)
@@ -78,11 +89,12 @@ fn snapshot_create_invalid_toml_json() {
     let tmp = config_dir("not valid toml @@@@");
     sodagun()
         .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
             "--output",
             "json",
             "snapshot",
             "create",
-            tmp.path().to_str().unwrap(),
         ])
         .assert()
         .failure()
@@ -96,7 +108,12 @@ fn snapshot_create_invalid_toml_json() {
 fn snapshot_create_missing_image_section_text() {
     let tmp = config_dir("[sandbox]\nworking_dir = \"/workspace\"\n");
     sodagun()
-        .args(["snapshot", "create", tmp.path().to_str().unwrap()])
+        .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
+            "snapshot",
+            "create",
+        ])
         .assert()
         .failure()
         .code(1)
@@ -108,11 +125,12 @@ fn snapshot_create_missing_image_section_json() {
     let tmp = config_dir("[sandbox]\nworking_dir = \"/workspace\"\n");
     sodagun()
         .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
             "--output",
             "json",
             "snapshot",
             "create",
-            tmp.path().to_str().unwrap(),
         ])
         .assert()
         .failure()
@@ -126,7 +144,12 @@ fn snapshot_create_missing_image_section_json() {
 fn snapshot_create_base_conflict_text() {
     let tmp = config_dir("[image]\nbase_image = \"alpine\"\nbase_snapshot = \"snap\"\n");
     sodagun()
-        .args(["snapshot", "create", tmp.path().to_str().unwrap()])
+        .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
+            "snapshot",
+            "create",
+        ])
         .assert()
         .failure()
         .code(1)
@@ -138,11 +161,12 @@ fn snapshot_create_base_conflict_json() {
     let tmp = config_dir("[image]\nbase_image = \"alpine\"\nbase_snapshot = \"snap\"\n");
     sodagun()
         .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
             "--output",
             "json",
             "snapshot",
             "create",
-            tmp.path().to_str().unwrap(),
         ])
         .assert()
         .failure()
@@ -157,7 +181,12 @@ fn snapshot_create_no_setup_script_text() {
     // [image] with only base_image — valid config but snapshot create requires a script.
     let tmp = config_dir("[image]\nbase_image = \"alpine:latest\"\n");
     sodagun()
-        .args(["snapshot", "create", tmp.path().to_str().unwrap()])
+        .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
+            "snapshot",
+            "create",
+        ])
         .assert()
         .failure()
         .code(1)
@@ -169,11 +198,12 @@ fn snapshot_create_no_setup_script_json() {
     let tmp = config_dir("[image]\nbase_image = \"alpine:latest\"\n");
     sodagun()
         .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
             "--output",
             "json",
             "snapshot",
             "create",
-            tmp.path().to_str().unwrap(),
         ])
         .assert()
         .failure()
@@ -194,7 +224,12 @@ fn nonexistent_snapshot_dir() -> TempDir {
 fn snapshot_remove_not_found_text() {
     let tmp = nonexistent_snapshot_dir();
     sodagun()
-        .args(["snapshot", "remove", tmp.path().to_str().unwrap()])
+        .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
+            "snapshot",
+            "remove",
+        ])
         .assert()
         .failure()
         .code(1)
@@ -206,11 +241,12 @@ fn snapshot_remove_not_found_json() {
     let tmp = nonexistent_snapshot_dir();
     sodagun()
         .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
             "--output",
             "json",
             "snapshot",
             "remove",
-            tmp.path().to_str().unwrap(),
         ])
         .assert()
         .failure()
@@ -225,10 +261,11 @@ fn snapshot_remove_force_nonexistent_succeeds() {
     let tmp = nonexistent_snapshot_dir();
     sodagun()
         .args([
+            "--project-dir",
+            tmp.path().to_str().unwrap(),
             "snapshot",
             "remove",
             "--force",
-            tmp.path().to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -249,13 +286,20 @@ fn snapshot_create_and_idempotent() {
 
     // Clear any stale snapshot from a previous run.
     sodagun()
-        .args(["snapshot", "remove", "--force", rootdir])
+        .args(["--project-dir", rootdir, "snapshot", "remove", "--force"])
         .assert()
         .success();
 
     // First create should succeed.
     let output = sodagun()
-        .args(["--output", "json", "snapshot", "create", rootdir])
+        .args([
+            "--project-dir",
+            rootdir,
+            "--output",
+            "json",
+            "snapshot",
+            "create",
+        ])
         .assert()
         .success()
         .get_output()
@@ -270,7 +314,14 @@ fn snapshot_create_and_idempotent() {
 
     // Second create (no --force) should report already_existed = true.
     let output2 = sodagun()
-        .args(["--output", "json", "snapshot", "create", rootdir])
+        .args([
+            "--project-dir",
+            rootdir,
+            "--output",
+            "json",
+            "snapshot",
+            "create",
+        ])
         .assert()
         .success()
         .get_output()
@@ -281,7 +332,7 @@ fn snapshot_create_and_idempotent() {
 
     // Clean up.
     sodagun()
-        .args(["snapshot", "remove", rootdir])
+        .args(["--project-dir", rootdir, "snapshot", "remove"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Removed."));
@@ -299,19 +350,19 @@ fn snapshot_create_force_recreates() {
 
     // Create once.
     sodagun()
-        .args(["snapshot", "create", rootdir])
+        .args(["--project-dir", rootdir, "snapshot", "create"])
         .assert()
         .success();
 
     // Force recreate should succeed.
     sodagun()
-        .args(["snapshot", "create", "--force", rootdir])
+        .args(["--project-dir", rootdir, "snapshot", "create", "--force"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Created snapshot:"));
 
     sodagun()
-        .args(["snapshot", "remove", rootdir])
+        .args(["--project-dir", rootdir, "snapshot", "remove"])
         .assert()
         .success();
 }
@@ -331,11 +382,12 @@ fn snapshot_setup_script_side_effects_persist() {
 
     let snap_output = sodagun()
         .args([
+            "--project-dir",
+            snap_cfg.path().to_str().unwrap(),
             "--output",
             "json",
             "snapshot",
             "create",
-            snap_cfg.path().to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -395,7 +447,12 @@ fn snapshot_setup_script_side_effects_persist() {
         .assert()
         .success();
     sodagun()
-        .args(["snapshot", "remove", snap_cfg.path().to_str().unwrap()])
+        .args([
+            "--project-dir",
+            snap_cfg.path().to_str().unwrap(),
+            "snapshot",
+            "remove",
+        ])
         .assert()
         .success();
 }

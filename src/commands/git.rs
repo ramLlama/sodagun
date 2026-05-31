@@ -22,11 +22,11 @@ pub enum GitSubcommand {
 
 #[derive(Args)]
 pub struct AddWorktreeArgs {
-    /// Path to the git repository.
-    pub repo_path: PathBuf,
-
     /// Name of the branch to create.
     pub branch_name: String,
+
+    /// Path to the git repository (default: auto-detected project dir).
+    pub repo_path: Option<PathBuf>,
 
     /// Parent directory for the workspace rootdir (default: system temp dir).
     #[arg(long)]
@@ -37,25 +37,25 @@ pub struct AddWorktreeArgs {
     pub base: String,
 }
 
-pub fn run(ctx: Context, cmd: GitCommand) {
+pub fn run(ctx: Context, cmd: GitCommand, project_dir: PathBuf) {
     match cmd.subcommand {
-        GitSubcommand::AddWorktree(args) => add_worktree(ctx, args),
+        GitSubcommand::AddWorktree(args) => add_worktree(ctx, args, project_dir),
     }
 }
 
-fn add_worktree(ctx: Context, args: AddWorktreeArgs) {
+fn add_worktree(ctx: Context, args: AddWorktreeArgs, project_dir: PathBuf) {
+    let repo_path = args.repo_path.unwrap_or(project_dir);
     let dir_prefix = args.dir_prefix.unwrap_or_else(std::env::temp_dir);
 
     // Canonicalize first so `.` resolves to the real directory name. Fall back to
     // file_name() on the raw path (handles permission errors / symlink loops), and
     // finally to a plain "repo" sentinel if neither yields a usable component.
-    let repo_name = args
-        .repo_path
+    let repo_name = repo_path
         .canonicalize()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .or_else(|| {
-            args.repo_path
+            repo_path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
         })
@@ -74,12 +74,12 @@ fn add_worktree(ctx: Context, args: AddWorktreeArgs) {
     let worktree_path = rootdir.join(&sanitized_branch);
 
     // Open repo
-    let repo = Repository::open(&args.repo_path).unwrap_or_else(|_| {
+    let repo = Repository::open(&repo_path).unwrap_or_else(|_| {
         handle_error(
             ctx,
             SodagunError {
                 code: "REPO_NOT_FOUND",
-                message: format!("Repository not found at {}", args.repo_path.display()),
+                message: format!("Repository not found at {}", repo_path.display()),
             },
         )
     });
@@ -195,10 +195,9 @@ fn add_worktree(ctx: Context, args: AddWorktreeArgs) {
         });
 
     // Write workspace metadata; roll back everything on failure
-    let repo_path = args
-        .repo_path
+    let repo_path = repo_path
         .canonicalize()
-        .unwrap_or_else(|_| args.repo_path.clone());
+        .unwrap_or_else(|_| repo_path.clone());
     let meta = WorkspaceMetadata::new(repo_path, args.branch_name.clone(), worktree_path.clone());
     if let Err(e) = meta.write(&rootdir) {
         let _ = branch.delete();
