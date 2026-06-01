@@ -1,4 +1,6 @@
-.PHONY: deps fmt lint typecheck test audit build install uninstall clean all
+.PHONY: deps fmt fmt-check lint typecheck test audit build-debug build-release-thin build-release install uninstall clean all
+
+_default: all
 
 # Requires cargo-audit and cargo-deny: cargo install cargo-audit cargo-deny
 deps:
@@ -7,6 +9,9 @@ deps:
 
 fmt:
 	cargo fmt --all
+
+fmt-check:
+	cargo fmt --all --check
 
 lint:
 	cargo clippy --all-targets --all-features -- -D warnings
@@ -19,13 +24,26 @@ test:
 
 audit:
 	cargo deny check
-	cargo audit
+	# The --ignore flags below cover advisories in microsandbox's transitive dep tree
+	# where no upgrade is available on our end.
+	cargo audit \
+		--ignore RUSTSEC-2025-0134 \
+		--ignore RUSTSEC-2025-0141 \
+		--ignore RUSTSEC-2026-0118 \
+		--ignore RUSTSEC-2026-0119 \
+		--ignore RUSTSEC-2023-0071
 
-build:
+build-debug:
+	cargo build
+
+build-release-thin:
+	cargo build --profile release-thin
+
+build-release:
 	cargo build --release
 
-install:
-	cargo install --path .
+install: build-release
+	cargo install --path . --profile release --locked
 
 uninstall:
 	cargo uninstall sodagun
@@ -33,4 +51,6 @@ uninstall:
 clean:
 	cargo clean
 
-all: fmt lint typecheck test audit
+check-all: fmt lint typecheck test audit
+
+all: check-all build-release-thin

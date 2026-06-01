@@ -1,4 +1,5 @@
 use clap::ValueEnum;
+use colored::Colorize;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -10,4 +11,21 @@ pub enum OutputFormat {
 #[derive(Debug, Clone, Copy)]
 pub struct Context {
     pub output: OutputFormat,
+    pub quiet: bool,
+}
+
+impl Context {
+    /// Print an informational line to stderr; suppressed when `--quiet`.
+    pub fn log(&self, msg: &str) {
+        if !self.quiet {
+            eprintln!("{}", msg);
+        }
+    }
+
+    /// Print a warning line to stderr; suppressed when `--quiet`.
+    pub fn warn(&self, msg: &str) {
+        if !self.quiet {
+            eprintln!("{} {}", "warning:".yellow().bold(), msg);
+        }
+    }
 }

@@ -5,6 +5,17 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 unmaintained = "all"
 unsound = "all"
+# rustls-pemfile is unmaintained (RUSTSEC-2025-0134) but we can't fix it —
+# it lives inside microsandbox's dep tree with no available upgrade.
+ignore = [
+    # rustls-pemfile unmaintained — inside microsandbox's dep tree, no upgrade path
+    "RUSTSEC-2025-0134",
+    # hickory-proto 0.26.0-alpha.1 DoS advisories — inside microsandbox-network, no upgrade path
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
+    # bincode unmaintained — inside microsandbox's dep tree, no upgrade path
+    "RUSTSEC-2025-0141",
+]
 
 [licenses]
 version = 2
@@ -15,6 +26,13 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "MPL-2.0",
     "Unicode-3.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "OpenSSL",
+    "Zlib",
+    "0BSD",
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]
