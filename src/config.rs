@@ -134,7 +134,7 @@ struct ConfigFile {
     sandbox: Option<SandboxConfig>,
 }
 
-/// Returns the default [`SandboxConfig`] used when no `.sodagun.toml` is present.
+/// Returns the default [`SandboxConfig`] used when no `sodagun.toml` is present.
 pub fn default_sandbox_config() -> SandboxConfig {
     SandboxConfig {
         working_dir: default_working_dir(),
@@ -147,7 +147,7 @@ pub fn default_sandbox_config() -> SandboxConfig {
     }
 }
 
-/// Returns the default [`ImageConfig`] used when no `.sodagun.toml` is present:
+/// Returns the default [`ImageConfig`] used when no `sodagun.toml` is present:
 /// alpine:latest with no setup script.
 pub fn default_image_config() -> ImageConfig {
     ImageConfig {
@@ -181,10 +181,10 @@ pub fn load_config(path: &Path) -> Result<(ImageConfig, SandboxConfig), SodagunE
         message: format!("invalid TOML: {e}"),
     })?;
 
-    // [image] is required when .sodagun.toml exists
+    // [image] is required when sodagun.toml exists
     let raw_image = file.image.ok_or_else(|| SodagunError {
         code: "CONFIG_INVALID",
-        message: "[image] section is required in .sodagun.toml".to_string(),
+        message: "[image] section is required in sodagun.toml".to_string(),
     })?;
 
     let sandbox = file.sandbox.unwrap_or_else(default_sandbox_config);
@@ -424,7 +424,7 @@ CUSTOM = "value"
 
     #[test]
     fn error_config_not_found() {
-        let err = load_config(Path::new("/nonexistent/.sodagun.toml")).unwrap_err();
+        let err = load_config(Path::new("/nonexistent/sodagun.toml")).unwrap_err();
         assert_eq!(err.code, "CONFIG_NOT_FOUND");
     }
 

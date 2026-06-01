@@ -272,7 +272,7 @@ fn stop_running_sandbox() {
     let rootdir = tmp.path();
     make_workspace(rootdir, "feature");
     fs::write(
-        rootdir.join("feature").join(".sodagun.toml"),
+        rootdir.join("feature").join("sodagun.toml"),
         "[image]\nbase_image = \"debian\"\n",
     )
     .unwrap();
@@ -301,7 +301,7 @@ fn remove_running_sandbox_implicit_stop() {
     let rootdir = tmp.path();
     make_workspace(rootdir, "feature");
     fs::write(
-        rootdir.join("feature").join(".sodagun.toml"),
+        rootdir.join("feature").join("sodagun.toml"),
         "[image]\nbase_image = \"debian\"\n",
     )
     .unwrap();

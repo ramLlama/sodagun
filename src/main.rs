@@ -32,7 +32,7 @@ struct Cli {
     quiet: bool,
 
     /// Project directory override. Defaults to the nearest ancestor (including CWD)
-    /// that contains a .sodagun.toml or .git directory.
+    /// that contains a sodagun.toml or .git directory.
     #[arg(long)]
     project_dir: Option<PathBuf>,
 
@@ -50,8 +50,8 @@ enum Commands {
     Snapshot(SnapshotCommand),
 }
 
-/// Walk up from CWD to find the project root, using `.sodagun.toml` or `.git/`
-/// as markers. Warns (unless quiet) if `.sodagun.toml` is not co-located with `.git`.
+/// Walk up from CWD to find the project root, using `sodagun.toml` or `.git/`
+/// as markers. Warns (unless quiet) if `sodagun.toml` is not co-located with `.git`.
 fn find_project_dir(override_dir: Option<PathBuf>, quiet: bool) -> PathBuf {
     if let Some(dir) = override_dir {
         return dir;
@@ -71,7 +71,7 @@ fn find_project_dir(override_dir: Option<PathBuf>, quiet: bool) -> PathBuf {
 
     let mut dir: &std::path::Path = &cwd;
     loop {
-        let has_toml = dir.join(".sodagun.toml").exists();
+        let has_toml = dir.join("sodagun.toml").exists();
         let has_git = dir.join(".git").exists();
 
         if project_dir.is_none() && (has_toml || has_git) {
@@ -97,19 +97,19 @@ fn find_project_dir(override_dir: Option<PathBuf>, quiet: bool) -> PathBuf {
 
     let project_dir = project_dir.unwrap_or_else(|| {
         eprintln!(
-            "{} no .sodagun.toml or .git directory found; use --project-dir to specify the project root",
+            "{} no sodagun.toml or .git directory found; use --project-dir to specify the project root",
             "error:".red().bold()
         );
         std::process::exit(1);
     });
 
-    // Warn if .sodagun.toml is found but not co-located with .git (not at the project root).
+    // Warn if sodagun.toml is found but not co-located with .git (not at the project root).
     if !quiet
         && let (Some(td), Some(gd)) = (&toml_dir, &git_root)
         && td != gd
     {
         eprintln!(
-            "{} .sodagun.toml should be at the project root ({}), not {}",
+            "{} sodagun.toml should be at the project root ({}), not {}",
             "warning:".yellow().bold(),
             gd.display(),
             td.display()

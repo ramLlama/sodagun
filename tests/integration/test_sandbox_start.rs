@@ -73,7 +73,7 @@ fn config_not_found_explicit_text() {
             "start",
             rootdir.to_str().unwrap(),
             "--config",
-            "/nonexistent/.sodagun.toml",
+            "/nonexistent/sodagun.toml",
         ])
         .assert()
         .failure()
@@ -95,7 +95,7 @@ fn config_not_found_explicit_json() {
             "start",
             rootdir.to_str().unwrap(),
             "--config",
-            "/nonexistent/.sodagun.toml",
+            "/nonexistent/sodagun.toml",
         ])
         .assert()
         .failure()
@@ -111,7 +111,7 @@ fn config_invalid_bad_toml_text() {
     let rootdir = tmp.path().join("workspace");
     make_workspace(&rootdir, "feature");
     fs::write(
-        rootdir.join("feature").join(".sodagun.toml"),
+        rootdir.join("feature").join("sodagun.toml"),
         "not valid toml @@@@",
     )
     .unwrap();
@@ -130,7 +130,7 @@ fn config_invalid_bad_toml_json() {
     let rootdir = tmp.path().join("workspace");
     make_workspace(&rootdir, "feature");
     fs::write(
-        rootdir.join("feature").join(".sodagun.toml"),
+        rootdir.join("feature").join("sodagun.toml"),
         "not valid toml @@@@",
     )
     .unwrap();
@@ -157,7 +157,7 @@ fn config_invalid_image_snapshot_conflict_text() {
     let rootdir = tmp.path().join("workspace");
     make_workspace(&rootdir, "feature");
     fs::write(
-        rootdir.join("feature").join(".sodagun.toml"),
+        rootdir.join("feature").join("sodagun.toml"),
         "[image]\nbase_image = \"debian\"\nbase_snapshot = \"my-snap\"\n",
     )
     .unwrap();
@@ -176,7 +176,7 @@ fn config_invalid_image_snapshot_conflict_json() {
     let rootdir = tmp.path().join("workspace");
     make_workspace(&rootdir, "feature");
     fs::write(
-        rootdir.join("feature").join(".sodagun.toml"),
+        rootdir.join("feature").join("sodagun.toml"),
         "[image]\nbase_image = \"debian\"\nbase_snapshot = \"my-snap\"\n",
     )
     .unwrap();
@@ -197,7 +197,7 @@ fn config_invalid_image_snapshot_conflict_json() {
 
 // --- Config resolution ---
 
-/// When the worktree has a .sodagun.toml, it takes precedence over the repo config.
+/// When the worktree has a sodagun.toml, it takes precedence over the repo config.
 /// Verified by giving the worktree bad TOML (→ CONFIG_INVALID) while the repo has valid TOML.
 #[test]
 fn config_resolution_worktree_over_repo() {
@@ -207,12 +207,12 @@ fn config_resolution_worktree_over_repo() {
     fs::create_dir_all(&repo).unwrap();
     make_workspace_with_repo(&rootdir, &repo, "feature");
     fs::write(
-        rootdir.join("feature").join(".sodagun.toml"),
+        rootdir.join("feature").join("sodagun.toml"),
         "not valid toml @@@@",
     )
     .unwrap();
     fs::write(
-        repo.join(".sodagun.toml"),
+        repo.join("sodagun.toml"),
         "[image]\nbase_image = \"debian\"\n",
     )
     .unwrap();
@@ -225,7 +225,7 @@ fn config_resolution_worktree_over_repo() {
         .stderr(predicate::str::contains("CONFIG_INVALID"));
 }
 
-/// When the worktree has no .sodagun.toml, the repo config is used as a fallback.
+/// When the worktree has no sodagun.toml, the repo config is used as a fallback.
 /// Verified by giving the repo bad TOML (→ CONFIG_INVALID) while the worktree has none.
 #[test]
 fn config_resolution_repo_fallback() {
@@ -234,7 +234,7 @@ fn config_resolution_repo_fallback() {
     let repo = tmp.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
     make_workspace_with_repo(&rootdir, &repo, "feature");
-    fs::write(repo.join(".sodagun.toml"), "not valid toml @@@@").unwrap();
+    fs::write(repo.join("sodagun.toml"), "not valid toml @@@@").unwrap();
 
     sodagun()
         .args(["sandbox", "start", rootdir.to_str().unwrap()])
@@ -253,7 +253,7 @@ fn start_creates_sandbox() {
     let rootdir = tmp.path();
     make_workspace(rootdir, "feature");
     fs::write(
-        rootdir.join("feature").join(".sodagun.toml"),
+        rootdir.join("feature").join("sodagun.toml"),
         "[image]\nbase_image = \"debian\"\n",
     )
     .unwrap();

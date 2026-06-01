@@ -15,7 +15,7 @@ pub struct SnapshotCommand {
 
 #[derive(Subcommand)]
 pub enum SnapshotSubcommand {
-    /// Create a snapshot from the [image] setup_script in .sodagun.toml.
+    /// Create a snapshot from the [image] setup_script in sodagun.toml.
     Create(CreateArgs),
     /// Remove a named snapshot.
     Remove(RemoveArgs),
@@ -25,7 +25,7 @@ pub enum SnapshotSubcommand {
 
 #[derive(Parser)]
 pub struct CreateArgs {
-    /// Path to the config file (default: <project-dir>/.sodagun.toml).
+    /// Path to the config file (default: <project-dir>/sodagun.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -36,7 +36,7 @@ pub struct CreateArgs {
 
 #[derive(Parser)]
 pub struct RemoveArgs {
-    /// Path to the config file (default: <project-dir>/.sodagun.toml).
+    /// Path to the config file (default: <project-dir>/sodagun.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -47,7 +47,7 @@ pub struct RemoveArgs {
 
 #[derive(Parser)]
 pub struct CleanArgs {
-    /// Path to the config file (default: <project-dir>/.sodagun.toml).
+    /// Path to the config file (default: <project-dir>/sodagun.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
 }
@@ -84,7 +84,7 @@ enum CreateOutcome {
 fn create(ctx: Context, args: CreateArgs, project_dir: PathBuf) {
     let config_path = args
         .config
-        .unwrap_or_else(|| project_dir.join(".sodagun.toml"));
+        .unwrap_or_else(|| project_dir.join("sodagun.toml"));
 
     let image_config = match config::load_image_config(&config_path) {
         Ok(c) => c,
@@ -156,7 +156,7 @@ fn create(ctx: Context, args: CreateArgs, project_dir: PathBuf) {
 fn remove(ctx: Context, args: RemoveArgs, project_dir: PathBuf) {
     let config_path = args
         .config
-        .unwrap_or_else(|| project_dir.join(".sodagun.toml"));
+        .unwrap_or_else(|| project_dir.join("sodagun.toml"));
 
     let image_config = match config::load_image_config(&config_path) {
         Ok(c) => c,
@@ -373,7 +373,7 @@ async fn create_async(
 fn clean(ctx: Context, args: CleanArgs, project_dir: PathBuf) {
     let config_path = args
         .config
-        .unwrap_or_else(|| project_dir.join(".sodagun.toml"));
+        .unwrap_or_else(|| project_dir.join("sodagun.toml"));
 
     let repo_path = match config_path.parent().and_then(|p| p.canonicalize().ok()) {
         Some(p) => p.to_string_lossy().into_owned(),

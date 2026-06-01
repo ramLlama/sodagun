@@ -9,10 +9,10 @@ fn sodagun() -> Command {
     Command::cargo_bin("sodagun").unwrap()
 }
 
-/// Write a `.sodagun.toml` to a temp directory and return the dir.
+/// Write a `sodagun.toml` to a temp directory and return the dir.
 fn config_dir(content: &str) -> TempDir {
     let tmp = TempDir::new().unwrap();
-    fs::write(tmp.path().join(".sodagun.toml"), content).unwrap();
+    fs::write(tmp.path().join("sodagun.toml"), content).unwrap();
     tmp
 }
 
@@ -443,7 +443,7 @@ fn snapshot_setup_script_side_effects_persist() {
     let rootdir = ws_tmp.path();
     make_workspace(rootdir, "worktree");
     fs::write(
-        rootdir.join("worktree").join(".sodagun.toml"),
+        rootdir.join("worktree").join("sodagun.toml"),
         format!("[image]\nbase_snapshot = {snap_name:?}\n"),
     )
     .unwrap();

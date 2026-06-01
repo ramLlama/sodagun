@@ -36,7 +36,7 @@ pub struct StartArgs {
     /// Workspace rootdir created by `git add-worktree`.
     pub workspace_path: PathBuf,
 
-    /// Path to the sodagun config file (default: <worktree-path>/.sodagun.toml).
+    /// Path to the sodagun config file (default: <worktree-path>/sodagun.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
 }
@@ -166,19 +166,19 @@ fn start(ctx: Context, args: StartArgs) {
         );
     }
 
-    // Config resolution: explicit --config > worktree/.sodagun.toml > repo/.sodagun.toml > defaults.
+    // Config resolution: explicit --config > worktree/sodagun.toml > repo/sodagun.toml > defaults.
     // The fallback to repo_path lets branches that haven't added a per-branch config yet
     // inherit the project-level config.
     let resolved_config: Option<std::path::PathBuf> = if let Some(path) = args.config {
         Some(path)
     } else {
-        let worktree_toml = meta.worktree_path.join(".sodagun.toml");
-        let repo_toml = meta.repo_path.join(".sodagun.toml");
+        let worktree_toml = meta.worktree_path.join("sodagun.toml");
+        let repo_toml = meta.repo_path.join("sodagun.toml");
         if worktree_toml.exists() {
             Some(worktree_toml)
         } else if repo_toml.exists() {
             ctx.log(&format!(
-                "no .sodagun.toml in worktree; using project config from {}",
+                "no sodagun.toml in worktree; using project config from {}",
                 repo_toml.display()
             ));
             Some(repo_toml)

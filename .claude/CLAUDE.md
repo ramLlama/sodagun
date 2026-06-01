@@ -35,10 +35,10 @@ Error code mapping (git2):
 
 ### `sandbox launch <worktree-path>`
 
-Reads `.sodagun.toml` from the worktree, creates a microsandbox via the microsandbox SDK, and prints the sandbox name. The worktree is bind-mounted at the configured `working_dir`.
+Reads `sodagun.toml` from the worktree, creates a microsandbox via the microsandbox SDK, and prints the sandbox name. The worktree is bind-mounted at the configured `working_dir`.
 
 Options:
-- `--config <path>` — config file path (default: `<worktree-path>/.sodagun.toml`)
+- `--config <path>` — config file path (default: `<worktree-path>/sodagun.toml`)
 
 Sandbox name: `sodagun-sb-<worktree-dirname>-<uuid8>`
 
@@ -82,7 +82,7 @@ JSON success: `{"status": "ok"}`
 Builds a deterministically named snapshot by running the `[image]` setup script inside an ephemeral sandbox, then snapshotting it. Snapshot name: `<sanitized-base>_<12-char-sha256>`. `sandbox launch` automatically boots from this snapshot when `[image]` is configured; it errors with a hint if the snapshot hasn't been created yet.
 
 Options:
-- `--config <path>` — config file path (default: `<rootdir>/.sodagun.toml`)
+- `--config <path>` — config file path (default: `<rootdir>/sodagun.toml`)
 - `--force` — recreate even if the snapshot already exists
 
 JSON success: `{"status": "ok", "snapshot_name": "...", "already_existed": false}`
@@ -108,12 +108,12 @@ JSON success: `{"status": "ok"}`
 `WORKTREE_NOT_FOUND`, `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `SANDBOX_NOT_FOUND`, `SANDBOX_ERROR`
 
 - `WORKTREE_NOT_FOUND` — worktree path does not exist or is not a directory
-- `CONFIG_NOT_FOUND` — `.sodagun.toml` missing from the config path
+- `CONFIG_NOT_FOUND` — `sodagun.toml` missing from the config path
 - `CONFIG_INVALID` — malformed TOML; missing `base_image`/`base_snapshot` in `[image]`; both set together; `setup_script`+`setup_script_path` conflict; a missing/unreadable `setup_files` entry; a `setup_files` entry with a non-UTF-8 basename; env/secret key conflict; invalid network mode; `cpus` out of `u8` range; bad volume format; `$HOME` not set for `~` expansion; unresolvable `value_from_env`; non-UTF-8 paths
 - `SANDBOX_NOT_FOUND` — named sandbox does not exist (maps `MicrosandboxError::SandboxNotFound`); emitted by `stop`, `remove`
 - `SANDBOX_ERROR` — microsandbox SDK failure (runtime creation, `create_detached`, `start`, `attach_shell`, stop/remove ops, stop timeout)
 
-### `.sodagun.toml` format
+### `sodagun.toml` format
 
 ```toml
 [image]
@@ -135,7 +135,7 @@ cpus = 1                    # default; type u8 (serde rejects values > 255 at pa
 volumes = ["~/.config/claude:/root/.config/claude:ro"]
 
 [sandbox.network]
-mode = "airgapped"   # default; options: airgapped, public-only, allow-all (kebab-case). This repo's own .sodagun.toml uses airgapped (deps are pre-fetched into the snapshot via setup_files + cargo fetch)
+mode = "airgapped"   # default; options: airgapped, public-only, allow-all (kebab-case). This repo's own sodagun.toml uses airgapped (deps are pre-fetched into the snapshot via setup_files + cargo fetch)
 
 [sandbox.env]
 TERM = "xterm-256color"
@@ -169,7 +169,7 @@ src/
   main.rs             # clap Cli struct, main(), dispatch
   context.rs          # OutputFormat (clap::ValueEnum, Default) + Context struct
   error.rs            # SodagunError (now #[derive(Debug)]), handle_error() -> !
-  config.rs           # .sodagun.toml parser; ImageConfig (incl. setup_files: Vec<SetupFile>), SetupFile { name, content }, SandboxConfig, NetworkConfig, SecretConfig, NetworkMode, load_config(), load_image_config(), snapshot_name()
+  config.rs           # sodagun.toml parser; ImageConfig (incl. setup_files: Vec<SetupFile>), SetupFile { name, content }, SandboxConfig, NetworkConfig, SecretConfig, NetworkMode, load_config(), load_image_config(), snapshot_name()
   commands/
     mod.rs
     git.rs            # GitCommand sub-app; add_worktree logic
