@@ -3,9 +3,14 @@ use std::path::PathBuf;
 use crate::config;
 use crate::context::{Context, OutputFormat};
 use crate::error::{SodagunError, handle_error};
+use crate::util;
 use clap::{Parser, Subcommand};
 use microsandbox::{ExecEvent, MicrosandboxError, NetworkPolicy, Sandbox, Snapshot};
 use uuid::Uuid;
+
+/// Guest directory the setup script and `setup_files` are patched into during
+/// snapshot creation. The script lands at `<SETUP_ASSETS_DIR>/<SETUP_SCRIPT_NAME>`.
+const SETUP_ASSETS_DIR: &str = "/setup-assets";
 
 #[derive(Parser)]
 pub struct SnapshotCommand {
@@ -60,19 +65,6 @@ pub fn run(ctx: Context, cmd: SnapshotCommand, project_dir: PathBuf) {
     }
 }
 
-fn make_runtime(ctx: Context) -> tokio::runtime::Runtime {
-    match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => handle_error(
-            ctx,
-            SodagunError {
-                code: "SNAPSHOT_ERROR",
-                message: format!("failed to start async runtime: {e}"),
-            },
-        ),
-    }
-}
-
 /// Outcome of a `snapshot create` call.
 enum CreateOutcome {
     /// Snapshot already existed and `--force` was not set.
@@ -114,7 +106,7 @@ fn create(ctx: Context, args: CreateArgs, project_dir: PathBuf) {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let rt = make_runtime(ctx);
+    let rt = util::get_runtime();
     let outcome = match rt.block_on(create_async(
         ctx,
         &image_config,
@@ -175,7 +167,7 @@ fn remove(ctx: Context, args: RemoveArgs, project_dir: PathBuf) {
         ),
     };
 
-    let rt = make_runtime(ctx);
+    let rt = util::get_runtime();
     match rt.block_on(remove_async(&snapshot_name, args.force)) {
         Ok(()) => match ctx.output {
             OutputFormat::Text => println!("Removed."),
@@ -192,9 +184,11 @@ fn snapshot_build_resources() -> (u32, u8) {
     let mut sys = System::new();
     sys.refresh_memory();
     let memory_mb = (sys.total_memory() / 1_048_576 / 2) as u32;
+    // If parallelism is unknown, assume a single core (the saturating_sub below
+    // then floors at 1 either way).
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(2);
+        .unwrap_or(1);
     let cpus = cpus.saturating_sub(2).max(1) as u8;
     (memory_mb, cpus)
 }
@@ -247,6 +241,7 @@ async fn create_async(
     ctx.log(&format!(
         "snapshot build resources: {snap_memory_mb} MiB RAM, {snap_cpus} CPUs"
     ));
+    let script_path = format!("{SETUP_ASSETS_DIR}/{}", config::SETUP_SCRIPT_NAME);
     builder = builder
         .cpus(snap_cpus)
         .memory(snap_memory_mb)
@@ -261,12 +256,12 @@ async fn create_async(
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str())),
         )
-        // Inject the setup script and any setup_files into /setup-assets/ via patches.
+        // Inject the setup script and any setup_files into SETUP_ASSETS_DIR via patches.
         .patch(|p| {
-            let mut p = p.text("/setup-assets/setup", script, Some(0o755), false);
+            let mut p = p.text(script_path.as_str(), script, Some(0o755), false);
             for f in &image_config.setup_files {
                 p = p.file(
-                    format!("/setup-assets/{}", f.name),
+                    format!("{SETUP_ASSETS_DIR}/{}", f.name),
                     f.content.clone(),
                     None,
                     false,
@@ -282,7 +277,7 @@ async fn create_async(
 
     // Run the setup script directly (no shell wrapper — script has a shebang and is mode 0o755).
     let mut handle = sandbox
-        .exec_stream("/setup-assets/setup", std::iter::empty::<&str>())
+        .exec_stream(script_path.as_str(), std::iter::empty::<&str>())
         .await
         .map_err(|e| SodagunError {
             code: "SNAPSHOT_ERROR",
@@ -386,7 +381,7 @@ fn clean(ctx: Context, args: CleanArgs, project_dir: PathBuf) {
         ),
     };
 
-    let rt = make_runtime(ctx);
+    let rt = util::get_runtime();
     let removed = match rt.block_on(clean_async(ctx, &repo_path)) {
         Ok(r) => r,
         Err(e) => handle_error(ctx, e),
@@ -440,10 +435,7 @@ async fn clean_async(ctx: Context, repo_path: &str) -> Result<Vec<String>, Sodag
         ctx.log(&format!("removing snapshot: {id}"));
         Snapshot::remove(&id, false)
             .await
-            .map_err(|e| SodagunError {
-                code: "SNAPSHOT_ERROR",
-                message: format!("failed to remove snapshot '{id}': {e}"),
-            })?;
+            .map_err(|e| util::map_snapshot_err(e, &id))?;
 
         removed.push(id);
     }
@@ -454,19 +446,8 @@ async fn clean_async(ctx: Context, repo_path: &str) -> Result<Vec<String>, Sodag
 async fn remove_async(name: &str, force: bool) -> Result<(), SodagunError> {
     match Snapshot::remove(name, false).await {
         Ok(()) => Ok(()),
-        Err(MicrosandboxError::SnapshotNotFound(_)) => {
-            if force {
-                Ok(())
-            } else {
-                Err(SodagunError {
-                    code: "SNAPSHOT_NOT_FOUND",
-                    message: format!("snapshot '{name}' not found"),
-                })
-            }
-        }
-        Err(e) => Err(SodagunError {
-            code: "SNAPSHOT_ERROR",
-            message: format!("failed to remove snapshot '{name}': {e}"),
-        }),
+        // `rm -f` semantics: a missing snapshot is success.
+        Err(MicrosandboxError::SnapshotNotFound(_)) if force => Ok(()),
+        Err(e) => Err(util::map_snapshot_err(e, name)),
     }
 }

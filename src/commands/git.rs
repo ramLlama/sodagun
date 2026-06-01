@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::context::{Context, OutputFormat};
 use crate::error::{SodagunError, handle_error};
+use crate::util::dashify;
 use crate::workspace::WorkspaceMetadata;
 
 #[derive(Args)]
@@ -44,33 +45,35 @@ pub fn run(ctx: Context, cmd: GitCommand, project_dir: PathBuf) {
 }
 
 fn add_worktree(ctx: Context, args: AddWorktreeArgs, project_dir: PathBuf) {
-    let repo_path = args.repo_path.unwrap_or(project_dir);
+    let raw_repo_path = args.repo_path.unwrap_or(project_dir);
     let dir_prefix = args.dir_prefix.unwrap_or_else(std::env::temp_dir);
 
-    // Canonicalize first so `.` resolves to the real directory name. Fall back to
-    // file_name() on the raw path (handles permission errors / symlink loops), and
-    // finally to a plain "repo" sentinel if neither yields a usable component.
+    // Resolve the repo path up front. A path that can't be canonicalized doesn't
+    // exist (or isn't accessible), so there's no repository to add a worktree to —
+    // fail now rather than limping along with a fallback name.
+    let repo_path = raw_repo_path.canonicalize().unwrap_or_else(|_| {
+        handle_error(
+            ctx,
+            SodagunError {
+                code: "REPO_NOT_FOUND",
+                message: format!("Repository not found at {}", raw_repo_path.display()),
+            },
+        )
+    });
+
+    // file_name() on a canonicalized path is only None for the filesystem root,
+    // which can't be a repo; the sentinel just keeps the generated name well-formed.
     let repo_name = repo_path
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .or_else(|| {
-            repo_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
+        .file_name()
+        .map(|n| dashify(&n.to_string_lossy()))
         .unwrap_or_else(|| "repo".to_string());
 
     let uuid8 = &Uuid::new_v4().to_string()[..8];
-    // `_` is the structural separator in the rootdir name, so strip it from components
-    // by collapsing `/` and `_` in repo/branch names to `-`. Best-effort: components
-    // still look clean while `_` stays unambiguous as a delimiter.
-    let sanitized_repo = repo_name.replace('_', "-");
-    let sanitized_branch = args.branch_name.replace(['/', '_'], "-");
+    // `_` is the structural separator in the rootdir name, so dashify() collapses it
+    // (and `/`, etc.) out of the components, keeping `_` unambiguous as the delimiter.
+    let sanitized_branch = dashify(&args.branch_name);
     // Convention: sodagun_{repo}_{branch}_{uuid8} — same name is reused for the sandbox.
-    let rootdir = dir_prefix.join(format!(
-        "sodagun_{sanitized_repo}_{sanitized_branch}_{uuid8}"
-    ));
+    let rootdir = dir_prefix.join(format!("sodagun_{repo_name}_{sanitized_branch}_{uuid8}"));
     let worktree_path = rootdir.join(&sanitized_branch);
 
     // Open repo
@@ -194,10 +197,8 @@ fn add_worktree(ctx: Context, args: AddWorktreeArgs, project_dir: PathBuf) {
             )
         });
 
-    // Write workspace metadata; roll back everything on failure
-    let repo_path = repo_path
-        .canonicalize()
-        .unwrap_or_else(|_| repo_path.clone());
+    // Write workspace metadata; roll back everything on failure. repo_path is
+    // already canonical (resolved at the top), so store it directly.
     let meta = WorkspaceMetadata::new(repo_path, args.branch_name.clone(), worktree_path.clone());
     if let Err(e) = meta.write(&rootdir) {
         let _ = branch.delete();
@@ -246,14 +247,10 @@ mod tests {
 
     #[test]
     fn branch_sanitization() {
-        // `/` and `_` in branch names both become `-`; `_` is reserved as the separator
-        assert_eq!(
-            "feature/my-thing".replace(['/', '_'], "-"),
-            "feature-my-thing"
-        );
-        assert_eq!(
-            "feat_underscore/sub".replace(['/', '_'], "-"),
-            "feat-underscore-sub"
-        );
+        use crate::util::dashify;
+        // The worktree subdir / sandbox name embed dashify()'d branch components,
+        // so `/` and `_` both collapse to `-` (`_` is reserved as the separator).
+        assert_eq!(dashify("feature/my-thing"), "feature-my-thing");
+        assert_eq!(dashify("feat_underscore/sub"), "feat-underscore-sub");
     }
 }

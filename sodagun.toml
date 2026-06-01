@@ -50,13 +50,9 @@ memory_mb   = 3072
 cpus        = 3
 
 [sandbox.network]
-mode = "airgapped"
+mode = "none"
 
 [sandbox.env]
 TERM             = "xterm-256color"
 RUST_BACKTRACE   = "1"
 HOME             = "/root"
-
-# [sandbox.secrets.ANTHROPIC_API_KEY]
-# value_from_env = "ANTHROPIC_API_KEY"
-# allowed_hosts  = ["api.anthropic.com"]

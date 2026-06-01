@@ -42,8 +42,8 @@ build-release-thin:
 build-release:
 	cargo build --release
 
-install:
-	cargo install --path .
+install: build-release
+	cargo install --path . --profile release --locked
 
 uninstall:
 	cargo uninstall sodagun

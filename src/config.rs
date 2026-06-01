@@ -1,11 +1,16 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::SodagunError;
+use crate::util::dashify;
+
+/// Reserved basename for the setup script injected into [`SETUP_ASSETS_DIR`].
+/// The leading underscore keeps it from colliding with any user `setup_files`.
+pub const SETUP_SCRIPT_NAME: &str = "_setup";
 
 /// A file to inject into `/setup-assets/` during snapshot creation.
 #[derive(Debug)]
@@ -20,8 +25,10 @@ pub struct SetupFile {
 pub enum NetworkMode {
     PublicOnly,
     AllowAll,
+    /// No network access. Named to match microsandbox's `NetworkPolicy::none()`,
+    /// which `disable_network()` applies.
     #[default]
-    Airgapped,
+    None,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -82,8 +89,7 @@ pub fn snapshot_name(base: &str, script: &str, setup_files: &[SetupFile]) -> Str
     let hash = hasher.finalize();
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hash[..]);
     let prefix = &b64[..12];
-    let sanitized = base.replace([':', '/', '@'], "-");
-    format!("{sanitized}_{prefix}")
+    format!("{}_{prefix}", dashify(base))
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,6 +276,16 @@ fn validate_image_config(
                 message: format!("setup_files entry '{path_str}' has a non-UTF-8 basename"),
             })?
             .to_string();
+        // The setup script is injected under this same basename; a collision would
+        // overwrite one with the other.
+        if name == SETUP_SCRIPT_NAME {
+            return Err(SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!(
+                    "setup_files entry '{path_str}' uses reserved name '{SETUP_SCRIPT_NAME}'"
+                ),
+            });
+        }
         let content = std::fs::read(&abs).map_err(|e| SodagunError {
             code: "CONFIG_INVALID",
             message: format!("failed to read setup_files entry '{}': {e}", abs.display()),
@@ -286,11 +302,45 @@ fn validate_image_config(
     })
 }
 
+/// Parse a Docker-style volume string (`"host:guest"` or `"host:guest:ro"`).
+///
+/// A leading `~` in the host path is expanded to `$HOME` here, at launch time,
+/// rather than at config-parse time — so the parsed [`SandboxConfig`] never
+/// carries an environment-dependent absolute path.
+pub fn parse_volume(s: &str) -> Result<(PathBuf, String, bool), SodagunError> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    if parts.len() < 2 {
+        return Err(SodagunError {
+            code: "CONFIG_INVALID",
+            message: format!("volume '{s}' must be 'host:guest' or 'host:guest:ro'"),
+        });
+    }
+    let host_raw = parts[0];
+    let guest = parts[1].to_string();
+    let readonly = parts.get(2).is_some_and(|f| *f == "ro");
+
+    let host = if let Some(rest) = host_raw.strip_prefix('~') {
+        let home = std::env::var("HOME").map_err(|_| SodagunError {
+            code: "CONFIG_INVALID",
+            message: "cannot expand '~' in volume: $HOME is not set".to_string(),
+        })?;
+        PathBuf::from(format!("{home}{rest}"))
+    } else {
+        PathBuf::from(host_raw)
+    };
+
+    Ok((host, guest, readonly))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::{NamedTempFile, TempDir};
+
+    // Serialize tests that mutate $HOME so they don't race parse_volume_tilde_expansion.
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
 
     fn write_config(content: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
@@ -444,7 +494,7 @@ CUSTOM = "value"
         assert_eq!(sb.working_dir, "/workspace");
         assert_eq!(sb.memory_mb, 512);
         assert_eq!(sb.cpus, 1);
-        assert_eq!(sb.network.mode, NetworkMode::Airgapped);
+        assert_eq!(sb.network.mode, NetworkMode::None);
     }
 
     #[test]
@@ -601,6 +651,65 @@ allowed_hosts = ["api.anthropic.com"]
             "[image]\nbase_image = \"alpine\"\nsetup_script = \"#!/bin/sh\\n\"\nsetup_files = [\"nonexistent.toml\"]\n",
         );
         let err = load_config(f.path()).unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+    }
+
+    #[test]
+    fn setup_files_reserved_name_returns_config_invalid() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(SETUP_SCRIPT_NAME), "x").unwrap();
+        let mut cfg = NamedTempFile::new_in(tmp.path()).unwrap();
+        cfg.write_all(
+            format!(
+                "[image]\nbase_image = \"alpine\"\nsetup_script = \"#!/bin/sh\\n\"\nsetup_files = [\"{SETUP_SCRIPT_NAME}\"]\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let err = load_config(cfg.path()).unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+    }
+
+    // ── parse_volume tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_volume_basic() {
+        let (host, guest, ro) = parse_volume("/host/path:/guest/path").unwrap();
+        assert_eq!(host, PathBuf::from("/host/path"));
+        assert_eq!(guest, "/guest/path");
+        assert!(!ro);
+    }
+
+    #[test]
+    fn parse_volume_readonly() {
+        let (_, _, ro) = parse_volume("/host:/guest:ro").unwrap();
+        assert!(ro);
+    }
+
+    #[test]
+    fn parse_volume_tilde_expansion() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        if let Ok(home) = std::env::var("HOME") {
+            let (host, _, _) = parse_volume("~/.config/claude:/root/.config/claude:ro").unwrap();
+            assert_eq!(host, PathBuf::from(format!("{home}/.config/claude")));
+        }
+    }
+
+    #[test]
+    fn parse_volume_no_home_error() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let saved = std::env::var("HOME").ok();
+        unsafe { std::env::remove_var("HOME") };
+        let err = parse_volume("~/.config:/root/.config").unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+        if let Some(h) = saved {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+    }
+
+    #[test]
+    fn parse_volume_missing_guest_error() {
+        let err = parse_volume("/only-host").unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");
     }
 }

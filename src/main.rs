@@ -7,6 +7,7 @@ mod commands;
 mod config;
 mod context;
 mod error;
+mod util;
 mod workspace;
 
 use commands::git::GitCommand;

@@ -1,13 +1,18 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::config::{ImageConfig, NetworkMode, SandboxConfig};
+use crate::config::{ImageConfig, NetworkMode, SandboxConfig, parse_volume};
 use crate::context::{Context, OutputFormat};
 use crate::error::{SodagunError, handle_error};
+use crate::util;
 use crate::workspace::WorkspaceMetadata;
 use clap::{Parser, Subcommand};
-use microsandbox::sandbox::SandboxStatus;
 use microsandbox::{MicrosandboxError, NetworkPolicy, Sandbox, Snapshot};
+
+/// Name prefix shared by all sodagun-created sandboxes: worktree sandboxes
+/// (`sodagun_<repo>_<branch>_<uuid>`) and ephemeral snapshot builders
+/// (`sodagun-snap-<uuid>`). Used to filter `sandbox list` to our own VMs.
+const SODAGUN_PREFIX: &str = "sodagun";
 
 #[derive(Parser)]
 pub struct SandboxCommand {
@@ -124,19 +129,6 @@ fn read_sandbox_name(ctx: Context, rootdir: &std::path::Path) -> String {
     })
 }
 
-fn make_runtime(ctx: Context) -> tokio::runtime::Runtime {
-    match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => handle_error(
-            ctx,
-            SodagunError {
-                code: "SANDBOX_ERROR",
-                message: format!("failed to start async runtime: {e}"),
-            },
-        ),
-    }
-}
-
 fn start(ctx: Context, args: StartArgs) {
     let meta =
         WorkspaceMetadata::read(&args.workspace_path).unwrap_or_else(|e| handle_error(ctx, e));
@@ -226,7 +218,7 @@ fn start(ctx: Context, args: StartArgs) {
         handle_error(ctx, e);
     }
 
-    let rt = make_runtime(ctx);
+    let rt = util::get_runtime();
     let name = match rt.block_on(start_async(
         ctx,
         &sandbox_name,
@@ -256,7 +248,7 @@ fn start(ctx: Context, args: StartArgs) {
 fn attach(ctx: Context, args: AttachArgs) {
     let sandbox_name = read_sandbox_name(ctx, &args.workspace_path);
 
-    let rt = make_runtime(ctx);
+    let rt = util::get_runtime();
     match rt.block_on(attach_async(&sandbox_name, !args.no_login)) {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(e) => handle_error(ctx, e),
@@ -266,7 +258,7 @@ fn attach(ctx: Context, args: AttachArgs) {
 fn exec(ctx: Context, args: ExecArgs) {
     let sandbox_name = read_sandbox_name(ctx, &args.workspace_path);
 
-    let rt = make_runtime(ctx);
+    let rt = util::get_runtime();
     match rt.block_on(exec_async(
         &sandbox_name,
         &args.cmd,
@@ -301,8 +293,8 @@ fn exec(ctx: Context, args: ExecArgs) {
 }
 
 fn list(ctx: Context, _args: ListArgs) {
-    let rt = make_runtime(ctx);
-    let sandboxes = match rt.block_on(list_async()) {
+    let rt = util::get_runtime();
+    let (sandboxes, hidden) = match rt.block_on(list_async()) {
         Ok(s) => s,
         Err(e) => handle_error(ctx, e),
     };
@@ -331,12 +323,19 @@ fn list(ctx: Context, _args: ListArgs) {
             );
         }
     }
+
+    // Note (to stderr, so JSON on stdout stays clean) when non-sodagun VMs were hidden.
+    if hidden > 0 {
+        ctx.log(&format!(
+            "{hidden} non-sodagun sandbox(es) hidden; run `msb list` to see all microsandbox VMs"
+        ));
+    }
 }
 
 fn stop(ctx: Context, args: StopArgs) {
     let sandbox_name = read_sandbox_name(ctx, &args.workspace_path);
 
-    let rt = make_runtime(ctx);
+    let rt = util::get_runtime();
     let timeout = Duration::from_secs(args.stop_timeout_seconds);
     match rt.block_on(stop_async(&sandbox_name, timeout, args.no_wait)) {
         Ok(()) => {}
@@ -358,7 +357,7 @@ fn stop(ctx: Context, args: StopArgs) {
 fn remove(ctx: Context, args: RemoveArgs) {
     let sandbox_name = read_sandbox_name(ctx, &args.workspace_path);
 
-    let rt = make_runtime(ctx);
+    let rt = util::get_runtime();
     let timeout = Duration::from_secs(args.stop_timeout_seconds);
     match rt.block_on(remove_async(&sandbox_name, timeout)) {
         Ok(()) => {}
@@ -376,73 +375,16 @@ fn remove(ctx: Context, args: RemoveArgs) {
     }
 }
 
-/// Parse a Docker-style volume string ("host:guest" or "host:guest:ro").
-/// Expands a leading `~` in the host path to $HOME.
-fn parse_volume(s: &str) -> Result<(PathBuf, String, bool), SodagunError> {
-    let parts: Vec<&str> = s.splitn(3, ':').collect();
-    if parts.len() < 2 {
-        return Err(SodagunError {
-            code: "CONFIG_INVALID",
-            message: format!("volume '{s}' must be 'host:guest' or 'host:guest:ro'"),
-        });
-    }
-    let host_raw = parts[0];
-    let guest = parts[1].to_string();
-    let readonly = parts.get(2).is_some_and(|f| *f == "ro");
-
-    let host = if let Some(rest) = host_raw.strip_prefix('~') {
-        let home = std::env::var("HOME").map_err(|_| SodagunError {
-            code: "CONFIG_INVALID",
-            message: "cannot expand '~' in volume: $HOME is not set".to_string(),
-        })?;
-        PathBuf::from(format!("{home}{rest}"))
-    } else {
-        PathBuf::from(host_raw)
-    };
-
-    Ok((host, guest, readonly))
-}
-
-fn status_label(s: SandboxStatus) -> &'static str {
-    match s {
-        SandboxStatus::Running => "running",
-        SandboxStatus::Draining => "draining",
-        SandboxStatus::Paused => "paused",
-        SandboxStatus::Stopped => "stopped",
-        SandboxStatus::Crashed => "crashed",
-    }
-}
-
-fn is_terminal_status(s: SandboxStatus) -> bool {
-    matches!(s, SandboxStatus::Stopped | SandboxStatus::Crashed)
-}
-
-/// Maps a microsandbox SDK error to a SodagunError, using SANDBOX_NOT_FOUND for
-/// unknown sandbox names and SANDBOX_ERROR for all other failures.
-pub fn map_sandbox_sdk_err(e: MicrosandboxError, sandbox_name: &str) -> SodagunError {
-    if matches!(e, MicrosandboxError::SandboxNotFound(_)) {
-        SodagunError {
-            code: "SANDBOX_NOT_FOUND",
-            message: format!("sandbox '{sandbox_name}' not found"),
-        }
-    } else {
-        SodagunError {
-            code: "SANDBOX_ERROR",
-            message: format!("{e}"),
-        }
-    }
-}
-
 /// Polls `Sandbox::get` every 500ms until the sandbox reaches a terminal status
 /// (Stopped or Crashed), or until `timeout` elapses. Checks status before sleeping
 /// so fast-stopping sandboxes are detected immediately.
-pub async fn poll_until_stopped(name: &str, timeout: Duration) -> Result<(), SodagunError> {
+async fn poll_until_stopped(name: &str, timeout: Duration) -> Result<(), SodagunError> {
     let deadline = Instant::now() + timeout;
     loop {
         let handle = Sandbox::get(name)
             .await
-            .map_err(|e| map_sandbox_sdk_err(e, name))?;
-        if is_terminal_status(handle.status()) {
+            .map_err(|e| util::map_sandbox_err(e, name))?;
+        if util::is_terminal_status(handle.status()) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -458,23 +400,34 @@ pub async fn poll_until_stopped(name: &str, timeout: Duration) -> Result<(), Sod
     }
 }
 
-async fn list_async() -> Result<Vec<(String, String)>, SodagunError> {
+/// Lists sodagun-managed sandboxes (those whose name starts with [`SODAGUN_PREFIX`]),
+/// returning them alongside the count of other microsandbox VMs filtered out.
+async fn list_async() -> Result<(Vec<(String, String)>, usize), SodagunError> {
     let handles = Sandbox::list().await.map_err(|e| SodagunError {
         code: "SANDBOX_ERROR",
         message: format!("failed to list sandboxes: {e}"),
     })?;
-    Ok(handles
+    let total = handles.len();
+    let sandboxes: Vec<(String, String)> = handles
         .into_iter()
-        .map(|h| (h.name().to_string(), status_label(h.status()).to_string()))
-        .collect())
+        .filter(|h| h.name().starts_with(SODAGUN_PREFIX))
+        .map(|h| {
+            (
+                h.name().to_string(),
+                util::status_label(h.status()).to_string(),
+            )
+        })
+        .collect();
+    let hidden = total - sandboxes.len();
+    Ok((sandboxes, hidden))
 }
 
-pub async fn stop_async(name: &str, timeout: Duration, no_wait: bool) -> Result<(), SodagunError> {
+async fn stop_async(name: &str, timeout: Duration, no_wait: bool) -> Result<(), SodagunError> {
     let handle = Sandbox::get(name)
         .await
-        .map_err(|e| map_sandbox_sdk_err(e, name))?;
+        .map_err(|e| util::map_sandbox_err(e, name))?;
     // Already terminal — stop is a no-op.
-    if is_terminal_status(handle.status()) {
+    if util::is_terminal_status(handle.status()) {
         return Ok(());
     }
     handle.stop().await.map_err(|e| SodagunError {
@@ -487,13 +440,13 @@ pub async fn stop_async(name: &str, timeout: Duration, no_wait: bool) -> Result<
     Ok(())
 }
 
-pub async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunError> {
+async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunError> {
     let handle = Sandbox::get(name)
         .await
-        .map_err(|e| map_sandbox_sdk_err(e, name))?;
+        .map_err(|e| util::map_sandbox_err(e, name))?;
 
     // Implicitly stop if still running before attempting removal.
-    if !is_terminal_status(handle.status()) {
+    if !util::is_terminal_status(handle.status()) {
         handle.stop().await.map_err(|e| SodagunError {
             code: "SANDBOX_ERROR",
             message: format!("failed to send stop signal to '{name}': {e}"),
@@ -503,7 +456,7 @@ pub async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunEr
 
     Sandbox::remove(name)
         .await
-        .map_err(|e| map_sandbox_sdk_err(e, name))
+        .map_err(|e| util::map_sandbox_err(e, name))
 }
 
 async fn start_async(
@@ -549,7 +502,7 @@ async fn start_async(
         .workdir(&sandbox_config.working_dir);
 
     builder = match sandbox_config.network.mode {
-        NetworkMode::Airgapped => builder.disable_network(),
+        NetworkMode::None => builder.disable_network(),
         NetworkMode::AllowAll => builder.network(|b| b.policy(NetworkPolicy::allow_all())),
         NetworkMode::PublicOnly => builder.network(|b| b.policy(NetworkPolicy::public_only())),
     };
@@ -641,10 +594,11 @@ async fn exec_async(
         })?;
 
     if login {
-        // Run via a login shell so profile files (and PATH) are sourced.
-        // `sh -l -c 'exec "$@"' sh <cmd> <args>` sources .profile then execs
-        // the real command, preserving argument quoting without shell-escaping.
-        let login_args: Vec<&str> = ["-l", "-c", "exec \"$@\"", "sh", cmd]
+        // Run through a login shell so profile files (and PATH, e.g. /root/.cargo/bin)
+        // are sourced. `sh -l -c 'exec "$0" "$@"' <cmd> <args>` sources the profiles
+        // then `exec` *replaces* the shell in place with the real command — no nested
+        // shell — preserving argv exactly without re-quoting (cmd is $0, args are $@).
+        let login_args: Vec<&str> = ["-l", "-c", "exec \"$0\" \"$@\"", cmd]
             .iter()
             .copied()
             .chain(args.iter().map(String::as_str))
@@ -690,56 +644,5 @@ async fn attach_async(sandbox_name: &str, login: bool) -> Result<i32, SodagunErr
             code: "SANDBOX_ERROR",
             message: format!("attach session failed: {e}"),
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use super::*;
-
-    // Serialize tests that mutate $HOME to prevent races with parse_volume_tilde_expansion.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn parse_volume_basic() {
-        let (host, guest, ro) = parse_volume("/host/path:/guest/path").unwrap();
-        assert_eq!(host, PathBuf::from("/host/path"));
-        assert_eq!(guest, "/guest/path");
-        assert!(!ro);
-    }
-
-    #[test]
-    fn parse_volume_readonly() {
-        let (_, _, ro) = parse_volume("/host:/guest:ro").unwrap();
-        assert!(ro);
-    }
-
-    #[test]
-    fn parse_volume_tilde_expansion() {
-        let _guard = HOME_LOCK.lock().unwrap();
-        if let Ok(home) = std::env::var("HOME") {
-            let (host, _, _) = parse_volume("~/.config/claude:/root/.config/claude:ro").unwrap();
-            assert_eq!(host, PathBuf::from(format!("{home}/.config/claude")));
-        }
-    }
-
-    #[test]
-    fn parse_volume_no_home_error() {
-        let _guard = HOME_LOCK.lock().unwrap();
-        let saved = std::env::var("HOME").ok();
-        unsafe { std::env::remove_var("HOME") };
-        let err = parse_volume("~/.config:/root/.config").unwrap_err();
-        assert_eq!(err.code, "CONFIG_INVALID");
-        if let Some(h) = saved {
-            unsafe { std::env::set_var("HOME", h) };
-        }
-    }
-
-    #[test]
-    fn parse_volume_missing_guest_error() {
-        let err = parse_volume("/only-host").unwrap_err();
-        assert_eq!(err.code, "CONFIG_INVALID");
     }
 }
