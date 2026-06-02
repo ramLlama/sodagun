@@ -1,19 +1,10 @@
 use std::fs;
 use std::path::Path;
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-fn sodagun() -> Command {
-    Command::cargo_bin("sodagun").unwrap()
-}
-
-fn sodagun_isolated(xdg_tmp: &TempDir) -> Command {
-    let mut cmd = Command::cargo_bin("sodagun").unwrap();
-    cmd.env("XDG_CONFIG_HOME", xdg_tmp.path());
-    cmd
-}
+use super::utils::{sodagun, sodagun_isolated};
 
 /// Write a `sodagun.toml` to a temp directory and return the dir.
 fn config_dir(content: &str) -> TempDir {

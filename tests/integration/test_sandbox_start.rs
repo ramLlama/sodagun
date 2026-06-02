@@ -1,21 +1,10 @@
 use std::fs;
 use std::path::Path;
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-fn sodagun() -> Command {
-    Command::cargo_bin("sodagun").unwrap()
-}
-
-/// Like `sodagun()` but with `XDG_CONFIG_HOME` pointing to an empty temp dir,
-/// isolating the test from the real `~/.config/sodagun/` user config.
-fn sodagun_isolated(xdg_tmp: &TempDir) -> Command {
-    let mut cmd = Command::cargo_bin("sodagun").unwrap();
-    cmd.env("XDG_CONFIG_HOME", xdg_tmp.path());
-    cmd
-}
+use super::utils::{sodagun, sodagun_isolated};
 
 /// Create a minimal workspace (rootdir + sodagun.json + worktree subdir) without
 /// needing a real git repo. Sufficient for config-error path tests.

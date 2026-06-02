@@ -1,18 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 
-fn sodagun() -> Command {
-    Command::cargo_bin("sodagun").unwrap()
-}
-
-fn sodagun_isolated(xdg_tmp: &tempfile::TempDir) -> Command {
-    let mut cmd = Command::cargo_bin("sodagun").unwrap();
-    cmd.env("XDG_CONFIG_HOME", xdg_tmp.path());
-    cmd
-}
+use super::utils::{sodagun, sodagun_isolated};
 
 /// Creates a minimal workspace with sandbox_name set to null.
 fn make_workspace(rootdir: &Path, branch: &str) {
