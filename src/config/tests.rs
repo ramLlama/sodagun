@@ -661,10 +661,11 @@ fn dockerfile_image_tag_correct_format() {
         insecure: None,
     };
     let tag = dockerfile_image_tag(&img, &reg, b"FROM alpine\n").unwrap();
-    // format: <host>/<namespace_repository>:<12-char-sha>
+    // format: <host>/<namespace_repository>:v<12-char-sha>
     assert!(tag.starts_with("registry.example.com/org/repo:"));
     let sha = tag.rsplit_once(':').unwrap().1;
-    assert_eq!(sha.len(), 12);
+    assert_eq!(sha.len(), 13);
+    assert!(sha.starts_with('v'));
 }
 
 #[test]

@@ -400,7 +400,8 @@ pub fn dockerfile_image_tag(
     let hash = hasher.finalize();
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hash[..]);
     // SHA-256 → 32 bytes → base64url (no pad) → 43 chars; [..12] is always in range.
-    let sha = &b64[..12];
+    // Prefix with "v" so the tag never starts with "-" (invalid per OCI tag rules).
+    let sha = format!("v{}", &b64[..12]);
 
     Ok(format!("{host}/{ns_repo}:{sha}"))
 }
