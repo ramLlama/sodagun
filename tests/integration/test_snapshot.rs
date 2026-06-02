@@ -1,13 +1,10 @@
 use std::fs;
 use std::path::Path;
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-fn sodagun() -> Command {
-    Command::cargo_bin("sodagun").unwrap()
-}
+use super::utils::{sodagun, sodagun_isolated};
 
 /// Write a `sodagun.toml` to a temp directory and return the dir.
 fn config_dir(content: &str) -> TempDir {
@@ -414,13 +411,15 @@ fn snapshot_create_force_recreates() {
 /// are baked into the snapshot.
 #[test]
 fn snapshot_setup_script_side_effects_persist() {
+    let xdg_tmp = TempDir::new().unwrap();
+
     // 1. Build a snapshot that installs git on top of alpine:latest.
     let setup_script = "#!/bin/sh\nset -e\napk add --no-cache git\n";
     let snap_cfg = config_dir(&format!(
         "[image]\nbase_image = \"alpine:latest\"\nsetup_script = {setup_script:?}\n"
     ));
 
-    let snap_output = sodagun()
+    let snap_output = sodagun_isolated(&xdg_tmp)
         .args([
             "--project-dir",
             snap_cfg.path().to_str().unwrap(),
@@ -449,13 +448,13 @@ fn snapshot_setup_script_side_effects_persist() {
     .unwrap();
 
     // 3. Start the sandbox.
-    sodagun()
+    sodagun_isolated(&xdg_tmp)
         .args(["sandbox", "start", rootdir.to_str().unwrap()])
         .assert()
         .success();
 
     // 4. Verify git is present — it was installed by the setup script, not in base alpine.
-    let exec_output = sodagun()
+    let exec_output = sodagun_isolated(&xdg_tmp)
         .args([
             "--output",
             "json",
@@ -482,11 +481,11 @@ fn snapshot_setup_script_side_effects_persist() {
     );
 
     // 5. Tear down sandbox and snapshot.
-    sodagun()
+    sodagun_isolated(&xdg_tmp)
         .args(["sandbox", "remove", rootdir.to_str().unwrap()])
         .assert()
         .success();
-    sodagun()
+    sodagun_isolated(&xdg_tmp)
         .args([
             "--project-dir",
             snap_cfg.path().to_str().unwrap(),

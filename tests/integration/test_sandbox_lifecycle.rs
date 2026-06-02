@@ -1,12 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 
-fn sodagun() -> Command {
-    Command::cargo_bin("sodagun").unwrap()
-}
+use super::utils::{sodagun, sodagun_isolated};
 
 /// Creates a minimal workspace with sandbox_name set to null.
 fn make_workspace(rootdir: &Path, branch: &str) {
@@ -269,6 +266,7 @@ fn stop_running_sandbox() {
     // Use tmp.path() directly as the rootdir so the sandbox name is the unique tmpXXX
     // dirname rather than a hardcoded "workspace" that collides across concurrent runs.
     let tmp = tempfile::TempDir::new().unwrap();
+    let xdg_tmp = tempfile::TempDir::new().unwrap();
     let rootdir = tmp.path();
     make_workspace(rootdir, "feature");
     fs::write(
@@ -277,19 +275,19 @@ fn stop_running_sandbox() {
     )
     .unwrap();
 
-    sodagun()
+    sodagun_isolated(&xdg_tmp)
         .args(["sandbox", "start", rootdir.to_str().unwrap()])
         .assert()
         .success();
 
-    sodagun()
+    sodagun_isolated(&xdg_tmp)
         .args(["sandbox", "stop", rootdir.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Stopped."));
 
     // Clean up so the stopped (but not removed) sandbox doesn't linger across runs.
-    sodagun()
+    sodagun_isolated(&xdg_tmp)
         .args(["sandbox", "remove", rootdir.to_str().unwrap()])
         .assert()
         .success();
@@ -298,6 +296,7 @@ fn stop_running_sandbox() {
 #[test]
 fn remove_running_sandbox_implicit_stop() {
     let tmp = tempfile::TempDir::new().unwrap();
+    let xdg_tmp = tempfile::TempDir::new().unwrap();
     let rootdir = tmp.path();
     make_workspace(rootdir, "feature");
     fs::write(
@@ -306,12 +305,12 @@ fn remove_running_sandbox_implicit_stop() {
     )
     .unwrap();
 
-    sodagun()
+    sodagun_isolated(&xdg_tmp)
         .args(["sandbox", "start", rootdir.to_str().unwrap()])
         .assert()
         .success();
 
-    sodagun()
+    sodagun_isolated(&xdg_tmp)
         .args(["sandbox", "remove", rootdir.to_str().unwrap()])
         .assert()
         .success()

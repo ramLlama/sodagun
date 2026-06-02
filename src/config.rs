@@ -12,36 +12,146 @@ use crate::util::dashify;
 /// The leading underscore keeps it from colliding with any user `setup_files`.
 pub const SETUP_SCRIPT_NAME: &str = "_setup";
 
-/// A file to inject into `/setup-assets/` during snapshot creation.
-#[derive(Debug)]
-pub struct SetupFile {
-    /// Basename used as `/setup-assets/<name>`.
-    pub name: String,
-    pub content: Vec<u8>,
-}
+/// Built-in network policy names. Always available; `network-policies.toml` cannot redefine them.
+pub const RESERVED_POLICY_NAMES: &[&str] = &["none", "allow-all", "public-only"];
 
-#[derive(Debug, Default, Deserialize, PartialEq)]
+// ── Network config types ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum NetworkMode {
-    PublicOnly,
-    AllowAll,
-    /// No network access. Named to match microsandbox's `NetworkPolicy::none()`,
-    /// which `disable_network()` applies.
-    #[default]
-    None,
+pub enum ConfigAction {
+    Allow,
+    Deny,
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct NetworkConfig {
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigDirection {
+    Egress,
+    Ingress,
+    Any,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NetworkRule {
+    pub direction: ConfigDirection,
+    pub action: ConfigAction,
+    pub destination: String,
+    pub protocol: Option<ConfigProtocol>,
     #[serde(default)]
-    pub mode: NetworkMode,
+    pub ports: Vec<u16>,
+}
+
+/// Network configuration for a sandbox; used in both `RawSandboxConfig` and `SandboxConfig`.
+///
+/// `#[serde(deny_unknown_fields)]` ensures the old `mode` field is rejected at parse time.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfig {
+    pub policy: Option<String>,
+    pub default_egress: Option<ConfigAction>,
+    pub default_ingress: Option<ConfigAction>,
+    #[serde(default)]
+    pub rules: Vec<NetworkRule>,
+}
+
+// ── Env / secret value sources ────────────────────────────────────────────────
+
+/// Dynamic value source shared by `[sandbox.env]` and `[sandbox.secrets]`.
+///
+/// Exactly one of the three fields must be set; the constraint is enforced at
+/// launch time (not parse time) so error messages are cleaner.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ValueSource {
+    pub value: Option<String>,
+    pub value_from_env: Option<String>,
+    /// Shell command whose stdout (trimmed) is the value. Runs on the host at launch time.
+    pub value_from_cmd: Option<String>,
+}
+
+/// Value for a `[sandbox.env]` entry — either a plain string literal or a dynamic source.
+///
+/// ```toml
+/// [sandbox.env]
+/// TERM = "xterm-256color"           # Literal
+///
+/// [sandbox.env.MY_TOKEN]
+/// value_from_cmd = "get-token.sh"   # Dynamic
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum EnvValue {
+    Literal(String),
+    Dynamic(ValueSource),
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SecretConfig {
     pub value_from_env: Option<String>,
     pub value: Option<String>,
+    pub value_from_cmd: Option<String>,
     pub allowed_hosts: Vec<String>,
+}
+
+// ── Raw sandbox config (for deserialization and merging) ──────────────────────
+
+/// Sandbox config as deserialized from TOML — all scalars are `Option` so that
+/// absent fields can be distinguished from default values during config merging.
+#[derive(Debug, Default, Deserialize)]
+pub struct RawSandboxConfig {
+    pub working_dir: Option<String>,
+    pub memory_mb: Option<u32>,
+    pub cpus: Option<u8>,
+    #[serde(default)]
+    pub volumes: Vec<String>,
+    #[serde(default)]
+    pub network: NetworkConfig,
+    #[serde(default)]
+    pub env: HashMap<String, EnvValue>,
+    #[serde(default)]
+    pub secrets: HashMap<String, SecretConfig>,
+}
+
+// ── Resolved sandbox config (fully merged) ───────────────────────────────────
+
+/// Fully resolved sandbox configuration after merging user + project configs.
+/// Not `Deserialize` — always produced by [`merge_sandbox_configs`].
+#[derive(Debug)]
+pub struct SandboxConfig {
+    pub working_dir: String,
+    pub memory_mb: u32,
+    pub cpus: u8,
+    pub volumes: Vec<String>,
+    pub network: NetworkConfig,
+    pub env: HashMap<String, EnvValue>,
+    pub secrets: HashMap<String, SecretConfig>,
+}
+
+// ── Named network policy (from ~/.config/sodagun/network-policies.toml) ──────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NamedPolicy {
+    pub default_egress: Option<ConfigAction>,
+    pub default_ingress: Option<ConfigAction>,
+    #[serde(default)]
+    pub rules: Vec<NetworkRule>,
+}
+
+// ── Image config ──────────────────────────────────────────────────────────────
+
+/// A file to inject into `/setup-assets/` during snapshot creation.
+#[derive(Debug)]
+pub struct SetupFile {
+    /// Basename used as `/setup-assets/<name>`.
+    pub name: String,
+    pub content: Vec<u8>,
 }
 
 /// Resolved image/snapshot configuration from the `[image]` TOML table.
@@ -92,23 +202,33 @@ pub fn snapshot_name(base: &str, script: &str, setup_files: &[SetupFile]) -> Str
     format!("{}_{prefix}", dashify(base))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SandboxConfig {
-    #[serde(default = "default_working_dir")]
-    pub working_dir: String,
-    #[serde(default = "default_memory_mb")]
-    pub memory_mb: u32,
-    #[serde(default = "default_cpus")]
-    pub cpus: u8,
-    #[serde(default)]
-    pub volumes: Vec<String>,
-    #[serde(default)]
-    pub network: NetworkConfig,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    #[serde(default)]
-    pub secrets: HashMap<String, SecretConfig>,
+// ── Default helpers ───────────────────────────────────────────────────────────
+
+fn default_working_dir() -> String {
+    "/workspace".to_string()
 }
+fn default_memory_mb() -> u32 {
+    512
+}
+fn default_cpus() -> u8 {
+    1
+}
+
+// ── Returns the default image config when no sodagun.toml is present ─────────
+
+/// Returns the default [`ImageConfig`] used when no `sodagun.toml` is present:
+/// alpine:latest with no setup script.
+pub fn default_image_config() -> ImageConfig {
+    ImageConfig {
+        base_image: Some("alpine:latest".to_string()),
+        base_snapshot: None,
+        setup_script: None,
+        setup_files: Vec::new(),
+        env: HashMap::new(),
+    }
+}
+
+// ── TOML deserialization ──────────────────────────────────────────────────────
 
 /// Raw deserialization struct for `[image]` — before validation / file resolution.
 #[derive(Deserialize)]
@@ -123,53 +243,27 @@ struct RawImageConfig {
     env: HashMap<String, String>,
 }
 
-fn default_working_dir() -> String {
-    "/workspace".to_string()
-}
-fn default_memory_mb() -> u32 {
-    512
-}
-fn default_cpus() -> u8 {
-    1
-}
-
 /// Top-level wrapper matching the TOML file structure.
 #[derive(Deserialize)]
 struct ConfigFile {
     image: Option<RawImageConfig>,
-    sandbox: Option<SandboxConfig>,
+    sandbox: Option<RawSandboxConfig>,
 }
 
-/// Returns the default [`SandboxConfig`] used when no `sodagun.toml` is present.
-pub fn default_sandbox_config() -> SandboxConfig {
-    SandboxConfig {
-        working_dir: default_working_dir(),
-        memory_mb: default_memory_mb(),
-        cpus: default_cpus(),
-        volumes: Vec::new(),
-        network: NetworkConfig::default(),
-        env: std::collections::HashMap::new(),
-        secrets: std::collections::HashMap::new(),
-    }
+/// Minimal wrapper for the user-level config file; `[image]` is silently ignored.
+#[derive(Deserialize)]
+struct UserConfigFile {
+    sandbox: Option<RawSandboxConfig>,
 }
 
-/// Returns the default [`ImageConfig`] used when no `sodagun.toml` is present:
-/// alpine:latest with no setup script.
-pub fn default_image_config() -> ImageConfig {
-    ImageConfig {
-        base_image: Some("alpine:latest".to_string()),
-        base_snapshot: None,
-        setup_script: None,
-        setup_files: Vec::new(),
-        env: HashMap::new(),
-    }
-}
+// ── Public API ────────────────────────────────────────────────────────────────
 
 /// Load and validate both `[image]` and `[sandbox]` from `path`.
 ///
 /// Returns `CONFIG_NOT_FOUND` if the file is missing, `CONFIG_INVALID` for any
-/// parse or validation failure.
-pub fn load_config(path: &Path) -> Result<(ImageConfig, SandboxConfig), SodagunError> {
+/// parse or validation failure. The returned `RawSandboxConfig` requires merging
+/// with the user config via [`merge_sandbox_configs`] before use.
+pub fn load_config(path: &Path) -> Result<(ImageConfig, RawSandboxConfig), SodagunError> {
     if !path.exists() {
         return Err(SodagunError {
             code: "CONFIG_NOT_FOUND",
@@ -193,19 +287,8 @@ pub fn load_config(path: &Path) -> Result<(ImageConfig, SandboxConfig), SodagunE
         message: "[image] section is required in sodagun.toml".to_string(),
     })?;
 
-    let sandbox = file.sandbox.unwrap_or_else(default_sandbox_config);
-
+    let sandbox = file.sandbox.unwrap_or_default();
     let image = validate_image_config(raw_image, path)?;
-
-    // Env var names must not appear in both env and secrets.
-    for key in sandbox.secrets.keys() {
-        if sandbox.env.contains_key(key.as_str()) {
-            return Err(SodagunError {
-                code: "CONFIG_INVALID",
-                message: format!("'{key}' appears in both [sandbox.env] and [sandbox.secrets]"),
-            });
-        }
-    }
 
     Ok((image, sandbox))
 }
@@ -214,6 +297,213 @@ pub fn load_config(path: &Path) -> Result<(ImageConfig, SandboxConfig), SodagunE
 pub fn load_image_config(path: &Path) -> Result<ImageConfig, SodagunError> {
     let (image, _sandbox) = load_config(path)?;
     Ok(image)
+}
+
+/// Load the `[sandbox]` section from the user-level config file
+/// (`$XDG_CONFIG_HOME/sodagun/sodagun.toml`).
+///
+/// Returns `None` if the file does not exist. Returns `CONFIG_INVALID` if the
+/// file exists but contains invalid TOML.
+pub fn load_user_sandbox_config() -> Result<Option<RawSandboxConfig>, SodagunError> {
+    let Some(path) = config_path("sodagun.toml") else {
+        return Ok(None);
+    };
+    load_user_sandbox_config_from_path(&path)
+}
+
+pub(crate) fn load_user_sandbox_config_from_path(
+    path: &Path,
+) -> Result<Option<RawSandboxConfig>, SodagunError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(path).map_err(|e| SodagunError {
+        code: "CONFIG_INVALID",
+        message: format!("failed to read user config: {e}"),
+    })?;
+    let file: UserConfigFile = toml::from_str(&contents).map_err(|e| SodagunError {
+        code: "CONFIG_INVALID",
+        message: format!("invalid TOML in user config: {e}"),
+    })?;
+    Ok(file.sandbox)
+}
+
+/// Load named network policies from `$XDG_CONFIG_HOME/sodagun/network-policies.toml`.
+///
+/// Returns `(map, None)` if the file does not exist, `(map, Some(path))` if it does.
+/// Returns `CONFIG_INVALID` if the file exists but is malformed.
+pub fn load_network_policies()
+-> Result<(HashMap<String, NamedPolicy>, Option<PathBuf>), SodagunError> {
+    let Some(path) = config_path("network-policies.toml") else {
+        return Ok((HashMap::new(), None));
+    };
+    let (map, exists) = load_network_policies_from_path(&path)?;
+    Ok((map, exists.then_some(path)))
+}
+
+pub(crate) fn load_network_policies_from_path(
+    path: &Path,
+) -> Result<(HashMap<String, NamedPolicy>, bool), SodagunError> {
+    if !path.exists() {
+        return Ok((HashMap::new(), false));
+    }
+    let contents = std::fs::read_to_string(path).map_err(|e| SodagunError {
+        code: "CONFIG_INVALID",
+        message: format!("failed to read network policies file: {e}"),
+    })?;
+    let policies: HashMap<String, NamedPolicy> =
+        toml::from_str(&contents).map_err(|e| SodagunError {
+            code: "CONFIG_INVALID",
+            message: format!("invalid network policies TOML: {e}"),
+        })?;
+    // Reserved names are always built-in; redefining them would shadow the built-ins silently.
+    for name in policies.keys() {
+        if RESERVED_POLICY_NAMES.contains(&name.as_str()) {
+            return Err(SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!(
+                    "network policy '{name}' is a reserved built-in name and cannot be redefined"
+                ),
+            });
+        }
+    }
+    Ok((policies, true))
+}
+
+/// Merge user and project sandbox configs into a resolved [`SandboxConfig`].
+///
+/// Merge semantics:
+/// - `volumes`: user first, then project appended
+/// - `env` / `secrets`: union; project wins on conflict
+/// - Scalars (`working_dir`, `memory_mb`, `cpus`): project > user > built-in default
+/// - `network.policy` / `default_egress` / `default_ingress`: project > user
+/// - `network.rules`: user inline first, then project inline
+///
+/// Validates that no key appears in both `env` and `secrets` after merging.
+/// `env` values may be plain strings or dynamic sources (`value_from_env`, `value_from_cmd`);
+/// dynamic sources are resolved at launch time, not here.
+pub fn merge_sandbox_configs(
+    user: Option<RawSandboxConfig>,
+    project: RawSandboxConfig,
+) -> Result<SandboxConfig, SodagunError> {
+    let RawSandboxConfig {
+        working_dir: user_wd,
+        memory_mb: user_mem,
+        cpus: user_cpus,
+        volumes: user_vols,
+        network: user_net,
+        env: user_env,
+        secrets: user_secrets,
+    } = user.unwrap_or_default();
+
+    let RawSandboxConfig {
+        working_dir: proj_wd,
+        memory_mb: proj_mem,
+        cpus: proj_cpus,
+        volumes: proj_vols,
+        network: proj_net,
+        env: proj_env,
+        secrets: proj_secrets,
+    } = project;
+
+    // Volumes: user first, project appended
+    let mut volumes = user_vols;
+    volumes.extend(proj_vols);
+
+    // Env and secrets: user base, project overwrites
+    let mut env = user_env;
+    env.extend(proj_env);
+
+    let mut secrets = user_secrets;
+    secrets.extend(proj_secrets);
+
+    // Scalars: project > user > built-in default
+    let working_dir = proj_wd.or(user_wd).unwrap_or_else(default_working_dir);
+    let memory_mb = proj_mem.or(user_mem).unwrap_or_else(default_memory_mb);
+    let cpus = proj_cpus.or(user_cpus).unwrap_or_else(default_cpus);
+
+    // Network: project > user for scalars; rules concatenated
+    let policy = proj_net.policy.or(user_net.policy);
+    let default_egress = proj_net.default_egress.or(user_net.default_egress);
+    let default_ingress = proj_net.default_ingress.or(user_net.default_ingress);
+    let mut rules = user_net.rules;
+    rules.extend(proj_net.rules);
+
+    // Env/secret conflict check on merged result
+    for key in secrets.keys() {
+        if env.contains_key(key.as_str()) {
+            return Err(SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!("'{key}' appears in both [sandbox.env] and [sandbox.secrets]"),
+            });
+        }
+    }
+
+    Ok(SandboxConfig {
+        working_dir,
+        memory_mb,
+        cpus,
+        volumes,
+        network: NetworkConfig {
+            policy,
+            default_egress,
+            default_ingress,
+            rules,
+        },
+        env,
+        secrets,
+    })
+}
+
+/// Parse a Docker-style volume string (`"host:guest"` or `"host:guest:ro"`).
+///
+/// A leading `~` in the host path is expanded to `$HOME` here, at launch time,
+/// rather than at config-parse time — so the parsed [`SandboxConfig`] never
+/// carries an environment-dependent absolute path.
+pub fn parse_volume(s: &str) -> Result<(PathBuf, String, bool), SodagunError> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    if parts.len() < 2 {
+        return Err(SodagunError {
+            code: "CONFIG_INVALID",
+            message: format!("volume '{s}' must be 'host:guest' or 'host:guest:ro'"),
+        });
+    }
+    let host_raw = parts[0];
+    let guest = parts[1].to_string();
+    let readonly = parts.get(2).is_some_and(|f| *f == "ro");
+
+    let host = if let Some(rest) = host_raw.strip_prefix('~') {
+        let home = std::env::var("HOME").map_err(|_| SodagunError {
+            code: "CONFIG_INVALID",
+            message: "cannot expand '~' in volume: $HOME is not set".to_string(),
+        })?;
+        PathBuf::from(format!("{home}{rest}"))
+    } else {
+        PathBuf::from(host_raw)
+    };
+
+    Ok((host, guest, readonly))
+}
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+/// Returns `$XDG_CONFIG_HOME/sodagun/<filename>` or `$HOME/.config/sodagun/<filename>`.
+/// Returns `None` when neither env var is set — that means no user config directory is
+/// available, which callers treat as "no user config" (not an error).
+fn config_path(filename: &str) -> Option<PathBuf> {
+    xdg_config_path(&format!("sodagun/{filename}"))
+}
+
+/// Returns `$XDG_CONFIG_HOME/<rel>` or `$HOME/.config/<rel>`, or `None` if
+/// neither env var is set.
+fn xdg_config_path(rel: &str) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        Some(PathBuf::from(dir).join(rel))
+    } else if let Ok(home) = std::env::var("HOME") {
+        Some(PathBuf::from(home).join(".config").join(rel))
+    } else {
+        None
+    }
 }
 
 fn validate_image_config(
@@ -302,35 +592,7 @@ fn validate_image_config(
     })
 }
 
-/// Parse a Docker-style volume string (`"host:guest"` or `"host:guest:ro"`).
-///
-/// A leading `~` in the host path is expanded to `$HOME` here, at launch time,
-/// rather than at config-parse time — so the parsed [`SandboxConfig`] never
-/// carries an environment-dependent absolute path.
-pub fn parse_volume(s: &str) -> Result<(PathBuf, String, bool), SodagunError> {
-    let parts: Vec<&str> = s.splitn(3, ':').collect();
-    if parts.len() < 2 {
-        return Err(SodagunError {
-            code: "CONFIG_INVALID",
-            message: format!("volume '{s}' must be 'host:guest' or 'host:guest:ro'"),
-        });
-    }
-    let host_raw = parts[0];
-    let guest = parts[1].to_string();
-    let readonly = parts.get(2).is_some_and(|f| *f == "ro");
-
-    let host = if let Some(rest) = host_raw.strip_prefix('~') {
-        let home = std::env::var("HOME").map_err(|_| SodagunError {
-            code: "CONFIG_INVALID",
-            message: "cannot expand '~' in volume: $HOME is not set".to_string(),
-        })?;
-        PathBuf::from(format!("{home}{rest}"))
-    } else {
-        PathBuf::from(host_raw)
-    };
-
-    Ok((host, guest, readonly))
-}
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -402,7 +664,6 @@ setup_script = "#!/bin/bash\napt-get update\n"
             "[image]\nbase_image = \"alpine:latest\"\nsetup_script_path = \"{}\"\n",
             script_file.path().display()
         );
-        // write_config uses NamedTempFile in the same dir; use explicit path
         let mut cfg = NamedTempFile::new().unwrap();
         cfg.write_all(config_content.as_bytes()).unwrap();
         let (img, _) = load_config(cfg.path()).unwrap();
@@ -487,14 +748,16 @@ CUSTOM = "value"
 
     // ── [sandbox] section tests ───────────────────────────────────────────────
 
+    /// After the network redesign, scalars in `RawSandboxConfig` are `None` when absent
+    /// (they get defaults only after `merge_sandbox_configs`).
     #[test]
     fn valid_sandbox_defaults() {
         let f = write_config("[image]\nbase_image = \"debian\"\n");
-        let (_, sb) = load_config(f.path()).unwrap();
-        assert_eq!(sb.working_dir, "/workspace");
-        assert_eq!(sb.memory_mb, 512);
-        assert_eq!(sb.cpus, 1);
-        assert_eq!(sb.network.mode, NetworkMode::None);
+        let (_, raw) = load_config(f.path()).unwrap();
+        assert!(raw.working_dir.is_none());
+        assert!(raw.memory_mb.is_none());
+        assert!(raw.cpus.is_none());
+        assert!(raw.network.policy.is_none());
     }
 
     #[test]
@@ -511,7 +774,7 @@ cpus = 2
 volumes = ["~/.config/claude:/root/.config/claude:ro"]
 
 [sandbox.network]
-mode = "public-only"
+policy = "public-only"
 
 [sandbox.env]
 TERM = "xterm-256color"
@@ -521,45 +784,304 @@ value_from_env = "ANTHROPIC_API_KEY"
 allowed_hosts = ["api.anthropic.com"]
 "#,
         );
-        let (_, sb) = load_config(f.path()).unwrap();
-        assert_eq!(sb.memory_mb, 1024);
-        assert_eq!(sb.cpus, 2);
-        assert_eq!(sb.network.mode, NetworkMode::PublicOnly);
-        assert_eq!(sb.volumes, ["~/.config/claude:/root/.config/claude:ro"]);
-        assert_eq!(
-            sb.env.get("TERM").map(String::as_str),
-            Some("xterm-256color")
-        );
-        let secret = sb.secrets.get("ANTHROPIC_API_KEY").unwrap();
+        let (_, raw) = load_config(f.path()).unwrap();
+        assert_eq!(raw.memory_mb, Some(1024));
+        assert_eq!(raw.cpus, Some(2));
+        assert_eq!(raw.network.policy.as_deref(), Some("public-only"));
+        assert_eq!(raw.volumes, ["~/.config/claude:/root/.config/claude:ro"]);
+        assert!(matches!(
+            raw.env.get("TERM"),
+            Some(EnvValue::Literal(s)) if s == "xterm-256color"
+        ));
+        let secret = raw.secrets.get("ANTHROPIC_API_KEY").unwrap();
         assert_eq!(secret.value_from_env.as_deref(), Some("ANTHROPIC_API_KEY"));
     }
 
+    /// The old `mode` field must be rejected because `NetworkConfig` uses `deny_unknown_fields`.
     #[test]
-    fn error_unknown_network_mode() {
-        let f = write_config(
-            "[image]\nbase_image = \"debian\"\n[sandbox.network]\nmode = \"unrestricted\"\n",
-        );
+    fn error_mode_field_rejected() {
+        let f =
+            write_config("[image]\nbase_image = \"debian\"\n[sandbox.network]\nmode = \"none\"\n");
         let err = load_config(f.path()).unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");
     }
 
     #[test]
-    fn error_env_secret_conflict() {
+    fn error_env_secret_conflict_still_detected_via_merge() {
+        // Conflict is now detected in merge_sandbox_configs, not load_config.
+        // This test verifies merge_sandbox_configs catches it.
+        let mut raw = RawSandboxConfig::default();
+        raw.env
+            .insert("MY_KEY".to_string(), EnvValue::Literal("val".to_string()));
+        raw.secrets.insert(
+            "MY_KEY".to_string(),
+            SecretConfig {
+                value_from_env: Some("MY_KEY".to_string()),
+                value: None,
+                value_from_cmd: None,
+                allowed_hosts: vec![],
+            },
+        );
+        let err = merge_sandbox_configs(None, raw).unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+    }
+
+    /// `value_from_cmd` parses correctly from TOML.
+    #[test]
+    fn value_from_cmd_parses() {
         let f = write_config(
             r#"
 [image]
-base_image = "debian"
+base_image = "alpine"
 
-[sandbox.env]
-ANTHROPIC_API_KEY = "literal"
-
-[sandbox.secrets.ANTHROPIC_API_KEY]
-value_from_env = "ANTHROPIC_API_KEY"
-allowed_hosts = ["api.anthropic.com"]
+[sandbox.secrets.MY_SECRET]
+value_from_cmd = "security find-generic-password -w -s my-service"
+allowed_hosts = []
 "#,
         );
-        let err = load_config(f.path()).unwrap_err();
+        let (_, raw) = load_config(f.path()).unwrap();
+        let secret = raw.secrets.get("MY_SECRET").unwrap();
+        assert_eq!(
+            secret.value_from_cmd.as_deref(),
+            Some("security find-generic-password -w -s my-service")
+        );
+        assert!(secret.value.is_none());
+        assert!(secret.value_from_env.is_none());
+    }
+
+    /// `value_from_cmd` and `value` can coexist at parse time
+    /// (conflict is detected at launch in `start_async`).
+    #[test]
+    fn value_from_cmd_with_value_parses() {
+        let f = write_config(
+            r#"
+[image]
+base_image = "alpine"
+
+[sandbox.secrets.MY_SECRET]
+value = "literal"
+value_from_cmd = "echo secret"
+allowed_hosts = []
+"#,
+        );
+        let (_, raw) = load_config(f.path()).unwrap();
+        let secret = raw.secrets.get("MY_SECRET").unwrap();
+        assert_eq!(secret.value.as_deref(), Some("literal"));
+        assert_eq!(secret.value_from_cmd.as_deref(), Some("echo secret"));
+    }
+
+    /// Dynamic `EnvValue` entries in `[sandbox.env]` parse correctly.
+    #[test]
+    fn env_value_dynamic_parses() {
+        let f = write_config(
+            r#"
+[image]
+base_image = "alpine"
+
+[sandbox.env]
+TERM = "xterm-256color"
+
+[sandbox.env.MY_TOKEN]
+value_from_cmd = "echo secret"
+"#,
+        );
+        let (_, raw) = load_config(f.path()).unwrap();
+        assert!(matches!(raw.env.get("TERM"), Some(EnvValue::Literal(s)) if s == "xterm-256color"));
+        let dynamic = raw.env.get("MY_TOKEN").unwrap();
+        assert!(
+            matches!(dynamic, EnvValue::Dynamic(src) if src.value_from_cmd.as_deref() == Some("echo secret"))
+        );
+    }
+
+    // ── load_network_policies tests ───────────────────────────────────────────
+
+    #[test]
+    fn load_network_policies_missing_file_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("network-policies.toml");
+        let (map, exists) = load_network_policies_from_path(&path).unwrap();
+        assert!(!exists);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn load_network_policies_valid_toml() {
+        let f = write_config(
+            r#"
+[my-policy]
+default_egress = "deny"
+default_ingress = "allow"
+
+[[my-policy.rules]]
+direction = "egress"
+action = "allow"
+destination = "api.example.com"
+"#,
+        );
+        let (map, exists) = load_network_policies_from_path(f.path()).unwrap();
+        assert!(exists);
+        let policy = map.get("my-policy").unwrap();
+        assert_eq!(policy.default_egress, Some(ConfigAction::Deny));
+        assert_eq!(policy.default_ingress, Some(ConfigAction::Allow));
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].destination, "api.example.com");
+    }
+
+    #[test]
+    fn load_network_policies_malformed_toml() {
+        let f = write_config("not valid toml @@@@");
+        let err = load_network_policies_from_path(f.path()).unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");
+    }
+
+    #[test]
+    fn load_network_policies_reserved_name_rejected() {
+        for reserved in RESERVED_POLICY_NAMES {
+            let toml = format!("[{reserved}]\ndefault_egress = \"deny\"\n");
+            let f = write_config(&toml);
+            let err = load_network_policies_from_path(f.path()).unwrap_err();
+            assert_eq!(
+                err.code, "CONFIG_INVALID",
+                "expected error for '{reserved}'"
+            );
+            assert!(
+                err.message.contains(reserved),
+                "error should mention the reserved name '{reserved}'; got: {}",
+                err.message
+            );
+        }
+    }
+
+    // ── merge_sandbox_configs tests ───────────────────────────────────────────
+
+    #[test]
+    fn merge_volumes_concatenated_user_first() {
+        let user = RawSandboxConfig {
+            volumes: vec!["~/.config/claude:/root/.config/claude:ro".to_string()],
+            ..Default::default()
+        };
+        let project = RawSandboxConfig {
+            volumes: vec!["/data:/data".to_string()],
+            ..Default::default()
+        };
+
+        let merged = merge_sandbox_configs(Some(user), project).unwrap();
+        assert_eq!(
+            merged.volumes,
+            ["~/.config/claude:/root/.config/claude:ro", "/data:/data"]
+        );
+    }
+
+    #[test]
+    fn merge_env_project_wins_on_conflict() {
+        let mut user = RawSandboxConfig::default();
+        user.env
+            .insert("TERM".to_string(), EnvValue::Literal("dumb".to_string()));
+        user.env.insert(
+            "USER_ONLY".to_string(),
+            EnvValue::Literal("yes".to_string()),
+        );
+
+        let mut project = RawSandboxConfig::default();
+        project.env.insert(
+            "TERM".to_string(),
+            EnvValue::Literal("xterm-256color".to_string()),
+        );
+
+        let merged = merge_sandbox_configs(Some(user), project).unwrap();
+        assert!(
+            matches!(merged.env.get("TERM"), Some(EnvValue::Literal(s)) if s == "xterm-256color")
+        );
+        assert!(matches!(merged.env.get("USER_ONLY"), Some(EnvValue::Literal(s)) if s == "yes"));
+    }
+
+    #[test]
+    fn merge_env_secret_conflict_returns_error() {
+        let mut project = RawSandboxConfig::default();
+        project
+            .env
+            .insert("MY_KEY".to_string(), EnvValue::Literal("val".to_string()));
+        project.secrets.insert(
+            "MY_KEY".to_string(),
+            SecretConfig {
+                value_from_env: Some("MY_KEY".to_string()),
+                value: None,
+                value_from_cmd: None,
+                allowed_hosts: vec![],
+            },
+        );
+        let err = merge_sandbox_configs(None, project).unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+    }
+
+    #[test]
+    fn merge_scalars_project_wins_over_user() {
+        let user = RawSandboxConfig {
+            working_dir: Some("/user".to_string()),
+            memory_mb: Some(256),
+            cpus: Some(1),
+            ..Default::default()
+        };
+        let project = RawSandboxConfig {
+            working_dir: Some("/project".to_string()),
+            memory_mb: Some(1024),
+            ..Default::default()
+        };
+
+        let merged = merge_sandbox_configs(Some(user), project).unwrap();
+        assert_eq!(merged.working_dir, "/project");
+        assert_eq!(merged.memory_mb, 1024);
+        // cpus: only user has it, project doesn't → user wins
+        assert_eq!(merged.cpus, 1);
+    }
+
+    #[test]
+    fn merge_scalars_defaults_when_neither_set() {
+        let merged = merge_sandbox_configs(None, RawSandboxConfig::default()).unwrap();
+        assert_eq!(merged.working_dir, "/workspace");
+        assert_eq!(merged.memory_mb, 512);
+        assert_eq!(merged.cpus, 1);
+    }
+
+    #[test]
+    fn merge_network_policy_project_wins() {
+        let mut user = RawSandboxConfig::default();
+        user.network.policy = Some("allow-all".to_string());
+
+        let mut project = RawSandboxConfig::default();
+        project.network.policy = Some("none".to_string());
+
+        let merged = merge_sandbox_configs(Some(user), project).unwrap();
+        assert_eq!(merged.network.policy.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn merge_network_rules_concatenated_user_first() {
+        let mut user = RawSandboxConfig::default();
+        user.network.rules = vec![NetworkRule {
+            direction: ConfigDirection::Egress,
+            action: ConfigAction::Allow,
+            destination: "user-api.example.com".to_string(),
+            protocol: None,
+            ports: vec![],
+        }];
+
+        let mut project = RawSandboxConfig::default();
+        project.network.rules = vec![NetworkRule {
+            direction: ConfigDirection::Egress,
+            action: ConfigAction::Allow,
+            destination: "project-api.example.com".to_string(),
+            protocol: None,
+            ports: vec![],
+        }];
+
+        let merged = merge_sandbox_configs(Some(user), project).unwrap();
+        assert_eq!(merged.network.rules.len(), 2);
+        assert_eq!(merged.network.rules[0].destination, "user-api.example.com");
+        assert_eq!(
+            merged.network.rules[1].destination,
+            "project-api.example.com"
+        );
     }
 
     // ── snapshot_name tests ───────────────────────────────────────────────────

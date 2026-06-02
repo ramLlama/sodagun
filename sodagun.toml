@@ -17,7 +17,10 @@ export CARGO_TARGET_DIR=/tmp/target
 EOF
 . "$SODAGUN_SETUP_PATH"
 
-apk add --no-cache build-base cmake pkgconf git curl ca-certificates make bash openssl-dev openssl-libs-static
+apk add --no-cache \
+  build-base cmake pkgconf \
+  git curl ca-certificates make bash \
+  openssl-dev openssl-libs-static
 
 #
 # rust setup
@@ -42,6 +45,12 @@ cd /
 
 # setup envvars for rust
 echo '. /root/.cargo/env' >> /root/.profile
+
+#
+# claude code setup
+#
+
+curl -fsSL https://claude.ai/install.sh | bash
 """
 
 [sandbox]
@@ -50,7 +59,7 @@ memory_mb   = 3072
 cpus        = 3
 
 [sandbox.network]
-mode = "none"
+policy = "claude-only"
 
 [sandbox.env]
 TERM             = "xterm-256color"

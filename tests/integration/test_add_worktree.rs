@@ -1,13 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use assert_cmd::Command;
 use git2::{Repository, Signature};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-fn sodagun() -> Command {
-    Command::cargo_bin("sodagun").unwrap()
-}
+use super::utils::sodagun;
 
 /// Create a minimal git repo with one commit and an `origin/main` remote ref.
 /// Mirrors the Python `git_repo` pytest fixture exactly.
