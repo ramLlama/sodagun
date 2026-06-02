@@ -732,52 +732,50 @@ fn to_sdk_action(action: ConfigAction) -> Action {
     }
 }
 
-/// When no policies file exists (`policies_path = None`), resolves built-in names:
-/// `none`, `allow-all`, `public-only`. When a policies file exists, looks up the
-/// name in the map; built-in names are NOT available (the file takes over completely).
+/// Resolve a named network policy. Built-in names (`none`, `allow-all`, `public-only`) are
+/// always available and take priority. Custom policies are looked up in the loaded map.
 fn apply_named_policy(
     builder: NetworkPolicyBuilder,
     name: &str,
     policies: &HashMap<String, NamedPolicy>,
     policies_path: Option<&std::path::Path>,
 ) -> Result<NetworkPolicyBuilder, SodagunError> {
-    if let Some(path) = policies_path {
-        let named = policies.get(name).ok_or_else(|| SodagunError {
-            code: "CONFIG_INVALID",
-            message: format!(
-                "unknown network policy '{name}'; define it in {}",
-                path.display()
-            ),
-        })?;
-        let mut b = builder;
-        if let Some(action) = named.default_egress {
-            b = b.default_egress(to_sdk_action(action));
-        }
-        if let Some(action) = named.default_ingress {
-            b = b.default_ingress(to_sdk_action(action));
-        }
-        for rule in &named.rules {
-            b = apply_rule(b, rule)?;
-        }
-        Ok(b)
-    } else {
-        match name {
-            "none" => Ok(builder.default_deny()),
-            "allow-all" => Ok(builder.default_allow()),
-            // public-only: deny egress by default, allow ingress by default (the builder's empty
-            // defaults already match: egress=Deny, ingress=Allow). Add DNS (UDP+TCP/53 to host
-            // gateway) and public internet egress rules, mirroring NetworkPolicy::public_only().
-            "public-only" => Ok(builder
+    // Built-ins are always resolved first; `network-policies.toml` cannot shadow them.
+    match name {
+        "none" => return Ok(builder.default_deny()),
+        "allow-all" => return Ok(builder.default_allow()),
+        // public-only: deny egress by default, allow ingress by default (the builder's empty
+        // defaults already match: egress=Deny, ingress=Allow). Add DNS (UDP+TCP/53 to host
+        // gateway) and public internet egress rules, mirroring NetworkPolicy::public_only().
+        "public-only" => {
+            return Ok(builder
                 .egress(|e| e.udp().tcp().port(53).allow_host())
-                .egress(|e| e.allow_public())),
-            _ => Err(SodagunError {
-                code: "CONFIG_INVALID",
-                message: format!(
-                    "unknown network policy '{name}'; available built-ins: none, allow-all, public-only"
-                ),
-            }),
+                .egress(|e| e.allow_public()));
         }
+        _ => {}
     }
+    let named = policies.get(name).ok_or_else(|| {
+        let hint = match policies_path {
+            Some(path) => format!("define it in {}", path.display()),
+            None => "no network-policies.toml found; built-ins are: none, allow-all, public-only"
+                .to_string(),
+        };
+        SodagunError {
+            code: "CONFIG_INVALID",
+            message: format!("unknown network policy '{name}'; {hint}"),
+        }
+    })?;
+    let mut b = builder;
+    if let Some(action) = named.default_egress {
+        b = b.default_egress(to_sdk_action(action));
+    }
+    if let Some(action) = named.default_ingress {
+        b = b.default_ingress(to_sdk_action(action));
+    }
+    for rule in &named.rules {
+        b = apply_rule(b, rule)?;
+    }
+    Ok(b)
 }
 
 /// Apply a single [`NetworkRule`] to the policy builder using a `rule()` closure.
@@ -1074,7 +1072,7 @@ mod tests {
         assert!(err.message.contains("unknown-policy"));
     }
 
-    /// Unknown policy name when policies file exists → CONFIG_INVALID.
+    /// Unknown custom policy name when policies file exists → CONFIG_INVALID.
     #[test]
     fn apply_named_policy_unknown_in_file_returns_error() {
         use crate::config::NamedPolicy;
@@ -1088,12 +1086,36 @@ mod tests {
         )]);
         let err = apply_named_policy(
             NetworkPolicy::builder(),
-            "none", // built-in name, but file exists → not found in file
+            "my-missing-policy",
             &policies,
             Some(std::path::Path::new("/test/network-policies.toml")),
         )
         .unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");
-        assert!(err.message.contains("none"));
+        assert!(err.message.contains("my-missing-policy"));
+    }
+
+    /// Built-in names work even when a policies file is present.
+    #[test]
+    fn apply_named_policy_builtin_works_with_file_present() {
+        use crate::config::NamedPolicy;
+        let policies = HashMap::from([(
+            "custom".to_string(),
+            NamedPolicy {
+                default_egress: None,
+                default_ingress: None,
+                rules: vec![],
+            },
+        )]);
+        // All three built-ins should resolve even when a file is loaded.
+        for name in ["none", "allow-all", "public-only"] {
+            apply_named_policy(
+                NetworkPolicy::builder(),
+                name,
+                &policies,
+                Some(std::path::Path::new("/test/network-policies.toml")),
+            )
+            .unwrap_or_else(|e| panic!("built-in '{name}' failed with file present: {e:?}"));
+        }
     }
 }

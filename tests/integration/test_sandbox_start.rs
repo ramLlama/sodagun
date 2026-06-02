@@ -370,22 +370,20 @@ fn config_invalid_value_from_cmd_trailing_newline_accepted() {
     }
 }
 
-// --- CONFIG_INVALID: built-in policy name rejected when policies file exists ---
+// --- CONFIG_INVALID: reserved policy name redefined in network-policies.toml ---
 
-/// When `network-policies.toml` exists, built-in names like `none` are not available —
-/// only names defined in the file are. Using `policy = "none"` with an existing but
-/// non-matching policies file should produce CONFIG_INVALID.
+/// `network-policies.toml` must not redefine reserved built-in names.
 #[test]
-fn config_invalid_builtin_name_rejected_when_policies_file_exists() {
+fn config_invalid_reserved_policy_name_redefined_in_file() {
     let tmp = TempDir::new().unwrap();
     let rootdir = tmp.path().join("workspace");
     let xdg_home = tmp.path().join("xdg");
     let policies_dir = xdg_home.join("sodagun");
     fs::create_dir_all(&policies_dir).unwrap();
-    // Create a policies file that does NOT define "none".
+    // Attempt to redefine the built-in "none" policy.
     fs::write(
         policies_dir.join("network-policies.toml"),
-        "[my-custom-policy]\ndefault_egress = \"deny\"\ndefault_ingress = \"allow\"\n",
+        "[none]\ndefault_egress = \"allow\"\n",
     )
     .unwrap();
     make_workspace(&rootdir, "feature");
@@ -401,7 +399,8 @@ fn config_invalid_builtin_name_rejected_when_policies_file_exists() {
         .assert()
         .failure()
         .code(1)
-        .stderr(predicate::str::contains("CONFIG_INVALID"));
+        .stderr(predicate::str::contains("CONFIG_INVALID"))
+        .stderr(predicate::str::contains("reserved"));
 }
 
 // --- Full start tests (require KVM / Apple Silicon hardware virtualization) ---

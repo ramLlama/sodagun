@@ -12,6 +12,9 @@ use crate::util::dashify;
 /// The leading underscore keeps it from colliding with any user `setup_files`.
 pub const SETUP_SCRIPT_NAME: &str = "_setup";
 
+/// Built-in network policy names. Always available; `network-policies.toml` cannot redefine them.
+pub const RESERVED_POLICY_NAMES: &[&str] = &["none", "allow-all", "public-only"];
+
 // ── Network config types ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -353,6 +356,17 @@ pub(crate) fn load_network_policies_from_path(
             code: "CONFIG_INVALID",
             message: format!("invalid network policies TOML: {e}"),
         })?;
+    // Reserved names are always built-in; redefining them would shadow the built-ins silently.
+    for name in policies.keys() {
+        if RESERVED_POLICY_NAMES.contains(&name.as_str()) {
+            return Err(SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!(
+                    "network policy '{name}' is a reserved built-in name and cannot be redefined"
+                ),
+            });
+        }
+    }
     Ok((policies, true))
 }
 
@@ -918,6 +932,24 @@ destination = "api.example.com"
         let f = write_config("not valid toml @@@@");
         let err = load_network_policies_from_path(f.path()).unwrap_err();
         assert_eq!(err.code, "CONFIG_INVALID");
+    }
+
+    #[test]
+    fn load_network_policies_reserved_name_rejected() {
+        for reserved in RESERVED_POLICY_NAMES {
+            let toml = format!("[{reserved}]\ndefault_egress = \"deny\"\n");
+            let f = write_config(&toml);
+            let err = load_network_policies_from_path(f.path()).unwrap_err();
+            assert_eq!(
+                err.code, "CONFIG_INVALID",
+                "expected error for '{reserved}'"
+            );
+            assert!(
+                err.message.contains(reserved),
+                "error should mention the reserved name '{reserved}'; got: {}",
+                err.message
+            );
+        }
     }
 
     // ── merge_sandbox_configs tests ───────────────────────────────────────────
