@@ -232,7 +232,15 @@ async fn create_async(
     let mut builder = Sandbox::builder(&ephemeral_name);
 
     if let Some(ref image) = image_config.base_image {
-        builder = builder.image(image.as_str());
+        let upper = image_config.oci_upper_size_mib;
+        builder = builder.image_with(|b| {
+            let b = b.oci(image.as_str());
+            if let Some(mib) = upper {
+                b.upper_size(mib)
+            } else {
+                b
+            }
+        });
     } else if let Some(ref snap) = image_config.base_snapshot {
         builder = builder.from_snapshot(snap.as_str());
     }
