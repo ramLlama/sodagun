@@ -455,22 +455,32 @@ pub fn merge_sandbox_configs(
     })
 }
 
-/// Parse a Docker-style volume string (`"host:guest"` or `"host:guest:ro"`).
+/// Mount options parsed from the options segment of a Docker-style volume string.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MountFlags {
+    /// Whether the mount is read-only (`ro`).
+    pub readonly: bool,
+    /// Whether direct execution from the mount is disabled (`noexec`).
+    pub noexec: bool,
+}
+
+/// Parse a Docker-style volume string: `"host:guest"` or `"host:guest:OPTIONS"`,
+/// where OPTIONS is a comma-separated list of `ro`, `rw`, `noexec`.
 ///
 /// A leading `~` in the host path is expanded to `$HOME` here, at launch time,
 /// rather than at config-parse time — so the parsed [`SandboxConfig`] never
 /// carries an environment-dependent absolute path.
-pub fn parse_volume(s: &str) -> Result<(PathBuf, String, bool), SodagunError> {
+pub fn parse_volume(s: &str) -> Result<(PathBuf, String, MountFlags), SodagunError> {
     let parts: Vec<&str> = s.splitn(3, ':').collect();
     if parts.len() < 2 {
         return Err(SodagunError {
             code: "CONFIG_INVALID",
-            message: format!("volume '{s}' must be 'host:guest' or 'host:guest:ro'"),
+            message: format!("volume '{s}' must be 'host:guest' or 'host:guest:OPTIONS'"),
         });
     }
     let host_raw = parts[0];
     let guest = parts[1].to_string();
-    let readonly = parts.get(2).is_some_and(|f| *f == "ro");
+    let flags = parse_mount_flags(parts.get(2).copied().unwrap_or(""), s)?;
 
     let host = if let Some(rest) = host_raw.strip_prefix('~') {
         let home = std::env::var("HOME").map_err(|_| SodagunError {
@@ -482,7 +492,26 @@ pub fn parse_volume(s: &str) -> Result<(PathBuf, String, bool), SodagunError> {
         PathBuf::from(host_raw)
     };
 
-    Ok((host, guest, readonly))
+    Ok((host, guest, flags))
+}
+
+/// Parse comma-separated mount options (`ro`, `rw`, `noexec`) into [`MountFlags`].
+fn parse_mount_flags(opts: &str, vol: &str) -> Result<MountFlags, SodagunError> {
+    let mut flags = MountFlags::default();
+    for opt in opts.split(',').filter(|o| !o.is_empty()) {
+        match opt {
+            "ro" => flags.readonly = true,
+            "rw" => {} // explicit rw is a no-op (read-write is the default)
+            "noexec" => flags.noexec = true,
+            _ => {
+                return Err(SodagunError {
+                    code: "CONFIG_INVALID",
+                    message: format!("unknown mount option '{opt}' in volume '{vol}'"),
+                });
+            }
+        }
+    }
+    Ok(flags)
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -1196,16 +1225,45 @@ destination = "api.example.com"
 
     #[test]
     fn parse_volume_basic() {
-        let (host, guest, ro) = parse_volume("/host/path:/guest/path").unwrap();
+        let (host, guest, flags) = parse_volume("/host/path:/guest/path").unwrap();
         assert_eq!(host, PathBuf::from("/host/path"));
         assert_eq!(guest, "/guest/path");
-        assert!(!ro);
+        assert_eq!(flags, MountFlags::default());
     }
 
     #[test]
     fn parse_volume_readonly() {
-        let (_, _, ro) = parse_volume("/host:/guest:ro").unwrap();
-        assert!(ro);
+        let (_, _, flags) = parse_volume("/host:/guest:ro").unwrap();
+        assert!(flags.readonly);
+        assert!(!flags.noexec);
+    }
+
+    #[test]
+    fn parse_volume_noexec() {
+        let (_, _, flags) = parse_volume("/host:/guest:noexec").unwrap();
+        assert!(!flags.readonly);
+        assert!(flags.noexec);
+    }
+
+    #[test]
+    fn parse_volume_ro_and_noexec() {
+        let (_, _, flags) = parse_volume("/host:/guest:ro,noexec").unwrap();
+        assert!(flags.readonly);
+        assert!(flags.noexec);
+    }
+
+    #[test]
+    fn parse_volume_explicit_rw() {
+        // rw is a no-op — read-write is already the default
+        let (_, _, flags) = parse_volume("/host:/guest:rw").unwrap();
+        assert_eq!(flags, MountFlags::default());
+    }
+
+    #[test]
+    fn parse_volume_unknown_option_error() {
+        let err = parse_volume("/host:/guest:nosuid").unwrap_err();
+        assert_eq!(err.code, "CONFIG_INVALID");
+        assert!(err.message.contains("nosuid"), "{}", err.message);
     }
 
     #[test]

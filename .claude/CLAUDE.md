@@ -177,7 +177,7 @@ HOME = "/root"                # env vars for the ephemeral build sandbox during 
 working_dir = "/workspace"  # default
 memory_mb = 512             # default; type u32
 cpus = 1                    # default; type u8 (serde rejects values > 255 at parse time)
-volumes = ["~/.config/claude:/root/.config/claude:ro"]
+volumes = ["~/.config/claude:/root/.config/claude:ro,noexec"]  # "host:guest" or "host:guest:OPTIONS" (comma-separated: ro, rw, noexec)
 
 [sandbox.network]
 policy = "none"   # built-in (none / allow-all / public-only) or a custom name from network-policies.toml. This repo's own sodagun.toml uses none (deps are pre-fetched into the snapshot via setup_files + cargo fetch)
@@ -233,7 +233,7 @@ Sandbox key invariants:
 - A key may not appear in both `[sandbox.env]` and `[sandbox.secrets]` — validated in `merge_sandbox_configs` (on the *merged* result), not `load_config`
 - Network policy is named, not a mode: `[sandbox.network].policy` selects a built-in (`none` → `default_deny()`, `allow-all` → `default_allow()`, `public-only` → hand-built to mirror `NetworkPolicy::public_only()`) or a custom policy from `network-policies.toml`. Built-ins are resolved first and shadow any same-named custom policy. An unknown name is `CONFIG_INVALID`; the error shows the policies-file path if the file exists, else the built-in list. `default_egress`/`default_ingress`/`rules` (inline or from the named policy) layer on via `apply_named_policy()` + `apply_rule()`
 - `cpus` is `u8` so serde rejects out-of-range values at parse time with `CONFIG_INVALID`
-- Volume strings are Docker-style `"host:guest"` or `"host:guest:ro"`; tilde (`~`) expansion to `$HOME` happens at launch time (`config::parse_volume`), not config-parse time
+- Volume strings are Docker-style `"host:guest"` or `"host:guest:OPTIONS"`, where `OPTIONS` is a comma-separated list of `ro` (read-only), `rw` (explicit read-write; no-op), and `noexec` (disable direct execution from the mount). An unknown option is `CONFIG_INVALID`. `config::parse_volume` returns `(PathBuf, String, MountFlags)` where `MountFlags { readonly: bool, noexec: bool }`. Tilde (`~`) expansion to `$HOME` happens at launch time (`config::parse_volume`), not config-parse time
 - `[sandbox.env]` values are either a plain string (`EnvValue::Literal`) or a dynamic `ValueSource` (`value` / `value_from_env` / `value_from_cmd`) — the same three sources as secrets. Exactly one source must be set (enforced at launch, not parse). `value_from_env` / `value_from_cmd` are resolved at launch time, not config-parse time, so values stay out of the parsed struct
 - `value_from_cmd` runs via `sh -c <cmd>` on the host; non-zero exit is `CONFIG_INVALID`; stdout is trimmed before use
 - All resolved env/secret values are checked by `validate_value_str()`: a value containing any control character (newline, CR, NUL, …) is `CONFIG_INVALID` (prevents a SIGABRT in the microsandbox VM)
@@ -249,11 +249,11 @@ src/
   error.rs            # SodagunError (#[derive(Debug)]), handle_error() -> !
   workspace.rs        # WorkspaceMetadata (sodagun.json: version, repo_path, branch, created_at, worktree_path, sandbox_name) + new()/read()/write()/set_sandbox_name()
   config.rs           # sodagun.toml parser; ImageConfig (incl. setup_files: Vec<SetupFile>, env), SetupFile { name, content }, RawSandboxConfig (Option scalars, for parse+merge) / SandboxConfig (resolved), NetworkConfig (policy: Option<String>, default_egress/ingress, rules), NetworkRule, NamedPolicy, EnvValue (untagged Literal|Dynamic), ValueSource, SecretConfig, ConfigAction/Direction/Protocol, SETUP_SCRIPT_NAME, RESERVED_POLICY_NAMES, load_config() (→ ImageConfig + RawSandboxConfig), load_image_config(), load_user_sandbox_config(), load_network_policies(), merge_sandbox_configs(), config_path(), snapshot_name(), parse_volume(), default_image_config()
-  util.rs             # dashify() name sanitizer + the microsandbox SDK↔sodagun layer: get_runtime() (OnceLock singleton), map_sandbox_err(), map_snapshot_err(), status_label(), is_terminal_status()
+  util.rs             # dashify() name sanitizer + the microsandbox SDK↔sodagun layer: get_runtime() (OnceLock singleton), map_sandbox_err(), map_snapshot_err(), status_label()
   commands/
     mod.rs
     git.rs            # GitCommand sub-app; add_worktree logic
-    sandbox.rs        # SandboxCommand sub-app; start()/attach()/exec()/list()/stop()/remove() + private async impls, read_sandbox_name(), poll_until_stopped(); value resolution (run_value_cmd, validate_value_str, resolve_value_source, resolve_env_value, resolve_secret_value) + network-policy building (apply_named_policy, apply_rule, commit_dest, to_sdk_action)
+    sandbox.rs        # SandboxCommand sub-app; start()/attach()/exec()/list()/stop()/remove() + private async impls, read_sandbox_name(); value resolution (run_value_cmd, validate_value_str, resolve_value_source, resolve_env_value, resolve_secret_value) + network-policy building (apply_named_policy, apply_rule, commit_dest, to_sdk_action)
     snapshot.rs       # SnapshotCommand sub-app; create()/remove()/clean() + async impls, snapshot_build_resources(), SETUP_ASSETS_DIR
 tests/
   integration.rs              # entry point: `mod integration { automod::dir!("tests/integration"); }` auto-discovers every file below as one shared test binary
@@ -279,7 +279,7 @@ Key invariants:
 - `sandbox attach` and `sandbox exec` exit with the inner process's exit code on success (via `std::process::exit()`), not a fixed code
 - Async SDK calls are bridged to the synchronous handlers with the shared `util::get_runtime()` runtime; the `*_async` functions own all `.await`s and are private to their command module
 - `util::map_sandbox_err()` maps `SandboxNotFound` → `SANDBOX_NOT_FOUND` (else `SANDBOX_ERROR`); `util::map_snapshot_err()` maps `SnapshotNotFound` → `SNAPSHOT_NOT_FOUND` (else `SNAPSHOT_ERROR`)
-- `poll_until_stopped()` (private, in `sandbox.rs`) polls `Sandbox::get().status()` every 500ms via `tokio::time::sleep`, checking status before sleeping; returns `SANDBOX_ERROR` on timeout
+- Stop/wait is delegated to the SDK: `stop`/`remove` call `SandboxHandle::stop_with_timeout(timeout)` to send a graceful shutdown and wait for the sandbox to halt. The `--no-wait` path uses `tokio::spawn` to fire the stop off without awaiting it
 - `snapshot create` builds the ephemeral sandbox with `.patch(...)`: the setup script is patched to `/setup-assets/_setup` (mode `0o755`; `_setup` = `config::SETUP_SCRIPT_NAME`, leading underscore avoids colliding with user `setup_files`), and each `setup_files` entry to `/setup-assets/<name>`. The script runs directly via `exec_stream("/setup-assets/_setup", …)`. Before snapshotting it runs `sync`, then `stop_and_wait()`. The resulting snapshot carries labels `created_by=sodagun`, `repo_path`, `setup_hash` (the 12-char base64url suffix of the name), and `source_image` — `repo_path` is what `snapshot clean` filters on
 
 ## Dev workflow

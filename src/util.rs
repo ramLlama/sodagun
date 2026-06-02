@@ -100,11 +100,6 @@ pub fn status_label(s: SandboxStatus) -> &'static str {
     }
 }
 
-/// Whether a sandbox status is terminal (no longer transitioning).
-pub fn is_terminal_status(s: SandboxStatus) -> bool {
-    matches!(s, SandboxStatus::Stopped | SandboxStatus::Crashed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

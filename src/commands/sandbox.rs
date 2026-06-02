@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::config::{
     ConfigAction, ConfigDirection, ConfigProtocol, EnvValue, ImageConfig, NamedPolicy, NetworkRule,
@@ -396,31 +396,6 @@ fn remove(ctx: Context, args: RemoveArgs) {
     }
 }
 
-/// Polls `Sandbox::get` every 500ms until the sandbox reaches a terminal status
-/// (Stopped or Crashed), or until `timeout` elapses. Checks status before sleeping
-/// so fast-stopping sandboxes are detected immediately.
-async fn poll_until_stopped(name: &str, timeout: Duration) -> Result<(), SodagunError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let handle = Sandbox::get(name)
-            .await
-            .map_err(|e| util::map_sandbox_err(e, name))?;
-        if util::is_terminal_status(handle.status()) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(SodagunError {
-                code: "SANDBOX_ERROR",
-                message: format!(
-                    "timed out waiting for sandbox '{name}' to stop after {}s",
-                    timeout.as_secs()
-                ),
-            });
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
 /// Lists sodagun-managed sandboxes (those whose name starts with [`SODAGUN_PREFIX`]),
 /// returning them alongside the count of other microsandbox VMs filtered out.
 async fn list_async() -> Result<(Vec<(String, String)>, usize), SodagunError> {
@@ -447,16 +422,19 @@ async fn stop_async(name: &str, timeout: Duration, no_wait: bool) -> Result<(), 
     let handle = Sandbox::get(name)
         .await
         .map_err(|e| util::map_sandbox_err(e, name))?;
-    // Already terminal — stop is a no-op.
-    if util::is_terminal_status(handle.status()) {
-        return Ok(());
-    }
-    handle.stop().await.map_err(|e| SodagunError {
-        code: "SANDBOX_ERROR",
-        message: format!("failed to send stop signal to '{name}': {e}"),
-    })?;
-    if !no_wait {
-        poll_until_stopped(name, timeout).await?;
+    if no_wait {
+        // Fire-and-forget: spawn so we return before the SDK's internal stop wait.
+        tokio::spawn(async move {
+            let _ = handle.stop().await;
+        });
+    } else {
+        handle
+            .stop_with_timeout(timeout)
+            .await
+            .map_err(|e| SodagunError {
+                code: "SANDBOX_ERROR",
+                message: format!("failed to stop sandbox '{name}': {e}"),
+            })?;
     }
     Ok(())
 }
@@ -466,14 +444,15 @@ async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunError>
         .await
         .map_err(|e| util::map_sandbox_err(e, name))?;
 
-    // Implicitly stop if still running before attempting removal.
-    if !util::is_terminal_status(handle.status()) {
-        handle.stop().await.map_err(|e| SodagunError {
+    // Implicitly stop (with timeout) before removal; stop_with_timeout is a no-op
+    // when the sandbox is already in a terminal state.
+    handle
+        .stop_with_timeout(timeout)
+        .await
+        .map_err(|e| SodagunError {
             code: "SANDBOX_ERROR",
-            message: format!("failed to send stop signal to '{name}': {e}"),
+            message: format!("failed to stop sandbox '{name}': {e}"),
         })?;
-        poll_until_stopped(name, timeout).await?;
-    }
 
     Sandbox::remove(name)
         .await
@@ -572,7 +551,7 @@ async fn start_async(
 
     // Additional volumes declared in config
     for vol_str in &sandbox_config.volumes {
-        let (host_path, guest_path, readonly) = parse_volume(vol_str)?;
+        let (host_path, guest_path, flags) = parse_volume(vol_str)?;
         let host_str = host_path
             .to_str()
             .ok_or_else(|| SodagunError {
@@ -580,11 +559,11 @@ async fn start_async(
                 message: format!("volume host path is non-UTF-8: {}", host_path.display()),
             })?
             .to_owned();
-        if readonly {
-            builder = builder.volume(guest_path, move |m| m.bind(&host_str).readonly());
-        } else {
-            builder = builder.volume(guest_path, move |m| m.bind(&host_str));
-        }
+        builder = builder.volume(guest_path, move |m| {
+            let m = m.bind(&host_str);
+            let m = if flags.readonly { m.readonly() } else { m };
+            if flags.noexec { m.noexec() } else { m }
+        });
     }
 
     // Env vars — resolve any dynamic sources (value_from_env, value_from_cmd) at launch time
