@@ -307,6 +307,69 @@ fn config_invalid_unknown_policy_no_policies_file() {
         .stderr(predicate::str::contains("CONFIG_INVALID"));
 }
 
+// --- CONFIG_INVALID: env var value contains control characters ---
+
+/// A `value_from_cmd` that emits multi-line output (e.g. `jq --raw-output` on a JSON array)
+/// must be caught before VM launch and reported as CONFIG_INVALID.
+/// Previously this caused SIGABRT in the VM because the env var passed to the SDK contained
+/// embedded newlines.
+#[test]
+fn config_invalid_value_from_cmd_multiline_output() {
+    let tmp = TempDir::new().unwrap();
+    let xdg_tmp = TempDir::new().unwrap();
+    let rootdir = tmp.path();
+    make_workspace(rootdir, "feature");
+    // `printf` emits two lines; simulates `jq --raw-output` on a JSON array.
+    fs::write(
+        rootdir.join("feature").join("sodagun.toml"),
+        "[image]\nbase_image = \"alpine:latest\"\n[sandbox.env.MY_VAR]\nvalue_from_cmd = \"printf 'line1\\nline2'\"\n",
+    )
+    .unwrap();
+
+    sodagun_isolated(&xdg_tmp)
+        .args(["sandbox", "start", rootdir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("CONFIG_INVALID"))
+        .stderr(predicate::str::contains("control character"));
+}
+
+/// A `value_from_cmd` that emits a trailing newline (the normal case for shell commands)
+/// must be accepted — `trim_end()` strips it and the value is valid.
+#[test]
+fn config_invalid_value_from_cmd_trailing_newline_accepted() {
+    let tmp = TempDir::new().unwrap();
+    let xdg_tmp = TempDir::new().unwrap();
+    let rootdir = tmp.path();
+    make_workspace(rootdir, "feature");
+    // `echo` adds a trailing newline; the value should trim to "hello" with no error.
+    fs::write(
+        rootdir.join("feature").join("sodagun.toml"),
+        "[image]\nbase_image = \"alpine:latest\"\n[sandbox.env.MY_VAR]\nvalue_from_cmd = \"echo hello\"\n",
+    )
+    .unwrap();
+
+    // This test only checks that the error is NOT about control characters; it may fail
+    // for other reasons (e.g. no hardware virtualization) but must not fail with CONFIG_INVALID.
+    let output = sodagun_isolated(&xdg_tmp)
+        .args(["sandbox", "start", rootdir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("CONFIG_INVALID"),
+        "trailing newline should be trimmed silently, not rejected; stderr: {stderr}"
+    );
+    // Clean up if sandbox actually started.
+    if output.status.success() {
+        sodagun_isolated(&xdg_tmp)
+            .args(["sandbox", "remove", rootdir.to_str().unwrap()])
+            .assert()
+            .success();
+    }
+}
+
 // --- CONFIG_INVALID: built-in policy name rejected when policies file exists ---
 
 /// When `network-policies.toml` exists, built-in names like `none` are not available —

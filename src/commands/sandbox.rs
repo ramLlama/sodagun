@@ -647,6 +647,22 @@ fn run_value_cmd(ctx: Context, var_name: &str, cmd: &str) -> Result<String, Soda
     Ok(value.trim_end().to_string())
 }
 
+/// Reject values that contain control characters (`\n`, `\r`, NUL, etc.).
+/// Both env vars and secrets must be single-line plain text; passing control characters
+/// to the microsandbox SDK causes the VM to SIGABRT before the agent relay starts.
+fn validate_value_str(label: &str, value: &str) -> Result<(), SodagunError> {
+    if let Some(bad) = value.chars().find(|c| c.is_control()) {
+        return Err(SodagunError {
+            code: "CONFIG_INVALID",
+            message: format!(
+                "'{label}': value contains a control character ({bad:?}); \
+                 values must be single-line plain text; got: {value:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Resolve a `ValueSource` (the dynamic form of `EnvValue`).
 fn resolve_value_source(
     ctx: Context,
@@ -671,10 +687,12 @@ fn resolve_value_source(
 
 /// Resolve an `EnvValue` to a plain string at launch time.
 fn resolve_env_value(ctx: Context, var_name: &str, val: &EnvValue) -> Result<String, SodagunError> {
-    match val {
-        EnvValue::Literal(s) => Ok(s.clone()),
-        EnvValue::Dynamic(src) => resolve_value_source(ctx, var_name, src),
-    }
+    let resolved = match val {
+        EnvValue::Literal(s) => s.clone(),
+        EnvValue::Dynamic(src) => resolve_value_source(ctx, var_name, src)?,
+    };
+    validate_value_str(var_name, &resolved)?;
+    Ok(resolved)
 }
 
 /// Resolve a secret's value from `value`, `value_from_env`, or `value_from_cmd`.
@@ -701,6 +719,10 @@ fn resolve_secret_value(
             ),
         }),
     }
+    .and_then(|v| {
+        validate_value_str(env_var, &v)?;
+        Ok(v)
+    })
 }
 
 fn to_sdk_action(action: ConfigAction) -> Action {
