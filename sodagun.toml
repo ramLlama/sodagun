@@ -1,57 +1,6 @@
 [image]
-base_image = "alpine:3.23"
-env         = { HOME = "/root" }
-setup_files = ["rust-toolchain.toml", "Cargo.toml", "Cargo.lock"]
-setup_script = """
-#!/bin/sh
-set -euxo pipefail
-
-#
-# system setup
-#
-
-SODAGUN_SETUP_PATH="/etc/profile.d/sodagun-setup.sh"
-cat > "$SODAGUN_SETUP_PATH" << 'EOF'
-ulimit -n 65536
-export CARGO_TARGET_DIR=/tmp/target
-EOF
-. "$SODAGUN_SETUP_PATH"
-
-apk add --no-cache \
-  build-base cmake pkgconf \
-  git curl ca-certificates make bash \
-  openssl-dev openssl-libs-static
-
-#
-# rust setup
-#
-
-# Install rustup with no default toolchain — toolchain version comes from rust-toolchain.toml
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-  sh -s -- -y --default-toolchain none --no-modify-path
-export PATH="/root/.cargo/bin:$PATH"
-rustup set auto-self-update disable
-
-# Single working dir: rustup reads rust-toolchain.toml; cargo fetch + install run here too
-mkdir -p /tmp/rust-setup
-cp /setup-assets/rust-toolchain.toml /tmp/rust-setup/
-cp /setup-assets/Cargo.toml /tmp/rust-setup/
-cp /setup-assets/Cargo.lock /tmp/rust-setup/
-cd /tmp/rust-setup
-rustup toolchain install          # reads rust-toolchain.toml; installs pinned toolchain + components
-cargo fetch --locked              # downloads all deps into /root/.cargo/registry
-cargo install cargo-deny cargo-audit   # installs to ~/.cargo/bin; CWD is irrelevant for installs
-cd /
-
-# setup envvars for rust
-echo '. /root/.cargo/env' >> /root/.profile
-
-#
-# claude code setup
-#
-
-curl -fsSL https://claude.ai/install.sh | bash
-"""
+dockerfile           = "Dockerfile"
+namespace_repository = "ramllama-sodagun-image/sodagun"
 
 [sandbox]
 working_dir = "/workspace"

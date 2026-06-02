@@ -537,7 +537,13 @@ fn create_image(ctx: Context, args: CreateImageArgs, project_dir: PathBuf) {
         };
 
     // Check whether the image already exists in the registry
-    if !args.force && podman_manifest_exists(&full_tag) {
+    let tls = if registry.insecure == Some(true) {
+        "--tls-verify=false"
+    } else {
+        "--tls-verify=true"
+    };
+
+    if !args.force && run_podman(&["manifest", "inspect", tls, &full_tag]).is_ok() {
         match ctx.output {
             OutputFormat::Text => println!("Image already exists: {full_tag}"),
             OutputFormat::Json => println!(
@@ -568,12 +574,20 @@ fn create_image(ctx: Context, args: CreateImageArgs, project_dir: PathBuf) {
         )
     });
 
-    if let Err(e) = run_podman(&["build", "-f", dockerfile_str, "-t", &full_tag, context_dir]) {
+    if let Err(e) = run_podman(&[
+        "build",
+        tls,
+        "-f",
+        dockerfile_str,
+        "-t",
+        &full_tag,
+        context_dir,
+    ]) {
         handle_error(ctx, e);
     }
 
     // Push
-    if let Err(e) = run_podman(&["push", &full_tag]) {
+    if let Err(e) = run_podman(&["push", tls, &full_tag]) {
         handle_error(ctx, e);
     }
 
@@ -590,31 +604,20 @@ fn create_image(ctx: Context, args: CreateImageArgs, project_dir: PathBuf) {
     }
 }
 
-/// Returns true if `podman manifest inspect <tag>` exits 0 (image exists in registry).
-fn podman_manifest_exists(tag: &str) -> bool {
-    std::process::Command::new("podman")
-        .args(["manifest", "inspect", tag])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 /// Run a podman subcommand, streaming stdout/stderr to the terminal.
-/// Returns `IMAGE_BUILD_ERROR` on non-zero exit.
+/// Returns `PODMAN_ERROR` on non-zero exit.
 fn run_podman(args: &[&str]) -> Result<(), SodagunError> {
     let status = std::process::Command::new("podman")
         .args(args)
         .status()
         .map_err(|e| SodagunError {
-            code: "IMAGE_BUILD_ERROR",
+            code: "PODMAN_ERROR",
             message: format!("failed to run podman: {e}"),
         })?;
     if !status.success() {
         let code = status.code().unwrap_or(-1);
         return Err(SodagunError {
-            code: "IMAGE_BUILD_ERROR",
+            code: "PODMAN_ERROR",
             message: format!("podman {} exited with code {code}", args[0]),
         });
     }

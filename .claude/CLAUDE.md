@@ -117,13 +117,13 @@ Flow: unless `--force`, checks existence with `podman manifest inspect <tag>` (s
 JSON success: `{"status": "ok", "image_tag": "...", "already_existed": false}`
 JSON error: `{"status": "error", "code": "<CODE>"}`
 
-Error codes: `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `IMAGE_BUILD_ERROR`
+Error codes: `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `PODMAN_ERROR`
 
-- `IMAGE_BUILD_ERROR` — `podman build` or `podman push` failed (non-zero exit or spawn failure)
+- `PODMAN_ERROR` — `podman build` or `podman push` failed (non-zero exit or spawn failure)
 
 ### Sandbox / workspace error codes
 
-`WORKSPACE_NOT_FOUND`, `WORKSPACE_INVALID`, `WORKTREE_NOT_FOUND`, `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `SANDBOX_NOT_STARTED`, `SANDBOX_ALREADY_STARTED`, `SANDBOX_NOT_FOUND`, `SANDBOX_ERROR`, `IMAGE_BUILD_ERROR`
+`WORKSPACE_NOT_FOUND`, `WORKSPACE_INVALID`, `WORKTREE_NOT_FOUND`, `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `SANDBOX_NOT_STARTED`, `SANDBOX_ALREADY_STARTED`, `SANDBOX_NOT_FOUND`, `SANDBOX_ERROR`, `PODMAN_ERROR`
 
 - `WORKSPACE_NOT_FOUND` — no `sodagun.json` in the given rootdir (was it created by sodagun?)
 - `WORKSPACE_INVALID` — `sodagun.json` is malformed, unreadable, or fails to serialize/write
@@ -257,7 +257,7 @@ Key invariants:
 - Async SDK calls are bridged to the synchronous handlers with the shared `util::get_runtime()` runtime; the `*_async` functions own all `.await`s and are private to their command module
 - `util::map_sandbox_err()` maps `SandboxNotFound` → `SANDBOX_NOT_FOUND` (else `SANDBOX_ERROR`)
 - Stop/wait is delegated to the SDK: `stop`/`remove` call `SandboxHandle::stop_with_timeout(timeout)` to send a graceful shutdown and wait for the sandbox to halt. The `--no-wait` path uses `tokio::spawn` to fire the stop off without awaiting it
-- `sandbox create-image` shells out to `podman` (not the microsandbox SDK): `podman manifest inspect <tag>` for the existence check, then `podman build -f <dockerfile> -t <tag> <context_dir>` and `podman push <tag>`. A non-zero exit or spawn failure on any of these is `IMAGE_BUILD_ERROR`. `sandbox start` boots a dockerfile image with `builder.image(tag)` (+ `builder.registry(|r| r.insecure())` when `registry.insecure` is set); `MicrosandboxError::ImageNotFound` from the SDK is mapped to a `SANDBOX_ERROR` whose message hints to run `sandbox create-image` first
+- `sandbox create-image` shells out to `podman` (not the microsandbox SDK): `podman manifest inspect <tag>` for the existence check, then `podman build -f <dockerfile> -t <tag> <context_dir>` and `podman push <tag>`. A non-zero exit or spawn failure on any of these is `PODMAN_ERROR`. `sandbox start` boots a dockerfile image with `builder.image(tag)` (+ `builder.registry(|r| r.insecure())` when `registry.insecure` is set); `MicrosandboxError::ImageNotFound` from the SDK is mapped to a `SANDBOX_ERROR` whose message hints to run `sandbox create-image` first
 
 ## Dev workflow
 
