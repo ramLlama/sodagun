@@ -6,11 +6,6 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::SodagunError;
-use crate::util::dashify;
-
-/// Reserved basename for the setup script injected into [`SETUP_ASSETS_DIR`].
-/// The leading underscore keeps it from colliding with any user `setup_files`.
-pub const SETUP_SCRIPT_NAME: &str = "_setup";
 
 /// Built-in network policy names. Always available; `network-policies.toml` cannot redefine them.
 pub const RESERVED_POLICY_NAMES: &[&str] = &["none", "allow-all", "public-only"];
@@ -144,62 +139,48 @@ pub struct NamedPolicy {
     pub rules: Vec<NetworkRule>,
 }
 
-// ── Image config ──────────────────────────────────────────────────────────────
+// ── Registry config ───────────────────────────────────────────────────────────
 
-/// A file to inject into `/setup-assets/` during snapshot creation.
-#[derive(Debug)]
-pub struct SetupFile {
-    /// Basename used as `/setup-assets/<name>`.
-    pub name: String,
-    pub content: Vec<u8>,
+#[derive(Deserialize, Default)]
+struct RawRegistryConfig {
+    host: Option<String>,
+    insecure: Option<bool>,
 }
 
-/// Resolved image/snapshot configuration from the `[image]` TOML table.
-///
-/// `setup_script` is always the resolved script content (either inline or read
-/// from `setup_script_path`). `setup_files` are resolved at load time.
+/// Resolved OCI registry configuration (from `[registry]` in sodagun.toml or user config).
+#[derive(Debug, Default)]
+pub struct RegistryConfig {
+    pub host: Option<String>,
+    pub insecure: Option<bool>,
+}
+
+// ── User-level image overrides ────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+struct RawUserImageConfig {
+    namespace_repository: Option<String>,
+    version: Option<String>,
+}
+
+/// User-level image configuration overrides from `~/.config/sodagun/sodagun.toml`.
+#[derive(Debug, Default)]
+pub struct UserImageConfig {
+    pub namespace_repository: Option<String>,
+    pub version: Option<String>,
+}
+
+// ── Image config ──────────────────────────────────────────────────────────────
+
+/// Resolved image configuration from the `[image]` TOML table.
 #[derive(Debug)]
 pub struct ImageConfig {
     pub base_image: Option<String>,
     pub base_snapshot: Option<String>,
-    /// Resolved setup script content; `None` means no setup, boot base directly.
-    pub setup_script: Option<String>,
-    /// Files injected into `/setup-assets/` during snapshot creation.
-    pub setup_files: Vec<SetupFile>,
-    /// Environment variables passed to the ephemeral sandbox during snapshot creation.
-    pub env: HashMap<String, String>,
-}
-
-impl ImageConfig {
-    /// Returns the deterministic snapshot name for this config, or `None` if
-    /// no setup script is configured.
-    pub fn derived_snapshot_name(&self) -> Option<String> {
-        let script = self.setup_script.as_ref()?;
-        let base = self
-            .base_image
-            .as_deref()
-            .or(self.base_snapshot.as_deref())
-            .unwrap_or("");
-        Some(snapshot_name(base, script, &self.setup_files))
-    }
-}
-
-/// Computes the deterministic snapshot name: `<sanitized_base>_<12 base64url chars of SHA256(script + setup_files)>`.
-///
-/// Setup files are sorted by name before hashing so the result is order-independent.
-pub fn snapshot_name(base: &str, script: &str, setup_files: &[SetupFile]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(script.as_bytes());
-    let mut sorted: Vec<_> = setup_files.iter().collect();
-    sorted.sort_by_key(|f| &f.name);
-    for f in sorted {
-        hasher.update(f.name.as_bytes());
-        hasher.update(&f.content);
-    }
-    let hash = hasher.finalize();
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hash[..]);
-    let prefix = &b64[..12];
-    format!("{}_{prefix}", dashify(base))
+    /// Resolved absolute path to the Dockerfile; `None` if no dockerfile configured.
+    pub dockerfile: Option<PathBuf>,
+    pub namespace_repository: Option<String>,
+    /// Version tag component; `None` is treated as `"1"` by [`dockerfile_image_tag`].
+    pub version: Option<String>,
 }
 
 // ── Default helpers ───────────────────────────────────────────────────────────
@@ -217,14 +198,14 @@ fn default_cpus() -> u8 {
 // ── Returns the default image config when no sodagun.toml is present ─────────
 
 /// Returns the default [`ImageConfig`] used when no `sodagun.toml` is present:
-/// alpine:latest with no setup script.
+/// alpine:latest with no setup.
 pub fn default_image_config() -> ImageConfig {
     ImageConfig {
         base_image: Some("alpine:latest".to_string()),
         base_snapshot: None,
-        setup_script: None,
-        setup_files: Vec::new(),
-        env: HashMap::new(),
+        dockerfile: None,
+        namespace_repository: None,
+        version: None,
     }
 }
 
@@ -235,12 +216,9 @@ pub fn default_image_config() -> ImageConfig {
 struct RawImageConfig {
     base_image: Option<String>,
     base_snapshot: Option<String>,
-    setup_script: Option<String>,
-    setup_script_path: Option<String>,
-    /// Paths relative to the config file; resolved to `SetupFile`s in `validate_image_config`.
-    setup_files: Option<Vec<String>>,
-    #[serde(default)]
-    env: HashMap<String, String>,
+    dockerfile: Option<String>,
+    namespace_repository: Option<String>,
+    version: Option<String>,
 }
 
 /// Top-level wrapper matching the TOML file structure.
@@ -248,12 +226,15 @@ struct RawImageConfig {
 struct ConfigFile {
     image: Option<RawImageConfig>,
     sandbox: Option<RawSandboxConfig>,
+    registry: Option<RawRegistryConfig>,
 }
 
-/// Minimal wrapper for the user-level config file; `[image]` is silently ignored.
+/// Minimal wrapper for the user-level config file.
 #[derive(Deserialize)]
 struct UserConfigFile {
     sandbox: Option<RawSandboxConfig>,
+    image: Option<RawUserImageConfig>,
+    registry: Option<RawRegistryConfig>,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -293,10 +274,135 @@ pub fn load_config(path: &Path) -> Result<(ImageConfig, RawSandboxConfig), Sodag
     Ok((image, sandbox))
 }
 
-/// Load only the `[image]` section from `path` (used by `snapshot create`).
-pub fn load_image_config(path: &Path) -> Result<ImageConfig, SodagunError> {
-    let (image, _sandbox) = load_config(path)?;
-    Ok(image)
+/// Load the `[registry]` section from a project config file at `path`.
+///
+/// Returns `RegistryConfig::default()` if the section is absent.
+/// Returns `CONFIG_INVALID` if the file exists but contains invalid TOML.
+pub fn load_registry_config(path: &Path) -> Result<RegistryConfig, SodagunError> {
+    if !path.exists() {
+        return Ok(RegistryConfig::default());
+    }
+    let contents = std::fs::read_to_string(path).map_err(|e| SodagunError {
+        code: "CONFIG_INVALID",
+        message: format!("failed to read config: {e}"),
+    })?;
+    let file: ConfigFile = toml::from_str(&contents).map_err(|e| SodagunError {
+        code: "CONFIG_INVALID",
+        message: format!("invalid TOML: {e}"),
+    })?;
+    Ok(raw_registry_to_config(file.registry.unwrap_or_default()))
+}
+
+/// Load the `[registry]` section from the user-level config file
+/// (`$XDG_CONFIG_HOME/sodagun/sodagun.toml`).
+///
+/// Returns `RegistryConfig::default()` if the file or section is absent.
+pub fn load_user_registry_config() -> Result<RegistryConfig, SodagunError> {
+    let Some(path) = config_path("sodagun.toml") else {
+        return Ok(RegistryConfig::default());
+    };
+    load_user_registry_config_from_path(&path)
+}
+
+pub(crate) fn load_user_registry_config_from_path(
+    path: &Path,
+) -> Result<RegistryConfig, SodagunError> {
+    if !path.exists() {
+        return Ok(RegistryConfig::default());
+    }
+    let contents = std::fs::read_to_string(path).map_err(|e| SodagunError {
+        code: "CONFIG_INVALID",
+        message: format!("failed to read user config: {e}"),
+    })?;
+    let file: UserConfigFile = toml::from_str(&contents).map_err(|e| SodagunError {
+        code: "CONFIG_INVALID",
+        message: format!("invalid TOML in user config: {e}"),
+    })?;
+    Ok(raw_registry_to_config(file.registry.unwrap_or_default()))
+}
+
+/// Merge user and project registry configs; project wins on each field.
+pub fn merge_registry_configs(user: RegistryConfig, project: RegistryConfig) -> RegistryConfig {
+    RegistryConfig {
+        host: project.host.or(user.host),
+        insecure: project.insecure.or(user.insecure),
+    }
+}
+
+/// Load `[image].namespace_repository` and `[image].version` from the user config file.
+///
+/// Returns `UserImageConfig::default()` if the file or section is absent.
+pub fn load_user_image_config() -> Result<UserImageConfig, SodagunError> {
+    let Some(path) = config_path("sodagun.toml") else {
+        return Ok(UserImageConfig::default());
+    };
+    load_user_image_config_from_path(&path)
+}
+
+pub(crate) fn load_user_image_config_from_path(
+    path: &Path,
+) -> Result<UserImageConfig, SodagunError> {
+    if !path.exists() {
+        return Ok(UserImageConfig::default());
+    }
+    let contents = std::fs::read_to_string(path).map_err(|e| SodagunError {
+        code: "CONFIG_INVALID",
+        message: format!("failed to read user config: {e}"),
+    })?;
+    let file: UserConfigFile = toml::from_str(&contents).map_err(|e| SodagunError {
+        code: "CONFIG_INVALID",
+        message: format!("invalid TOML in user config: {e}"),
+    })?;
+    let raw = file.image.unwrap_or_default();
+    Ok(UserImageConfig {
+        namespace_repository: raw.namespace_repository,
+        version: raw.version,
+    })
+}
+
+/// Apply user image overrides to a project `ImageConfig`.
+///
+/// Project wins on each field where both are `Some`; user values fill in where
+/// the project field is `None`.
+pub fn merge_user_image_config(user: UserImageConfig, mut project: ImageConfig) -> ImageConfig {
+    project.namespace_repository = project.namespace_repository.or(user.namespace_repository);
+    project.version = project.version.or(user.version);
+    project
+}
+
+/// Compute the full OCI image tag for a Dockerfile-based image.
+///
+/// Tag format: `<host>/<namespace_repository>:<sha>`
+/// where `sha` = first 12 base64url chars of SHA-256(dockerfile_bytes ‖ version_bytes).
+///
+/// Returns `CONFIG_INVALID` if `registry.host` or `image_config.namespace_repository` is unset.
+pub fn dockerfile_image_tag(
+    image_config: &ImageConfig,
+    registry: &RegistryConfig,
+    dockerfile_bytes: &[u8],
+) -> Result<String, SodagunError> {
+    let ns_repo = image_config
+        .namespace_repository
+        .as_deref()
+        .ok_or_else(|| SodagunError {
+            code: "CONFIG_INVALID",
+            message: "image.namespace_repository is required when using a dockerfile".to_string(),
+        })?;
+    let host = registry.host.as_deref().ok_or_else(|| SodagunError {
+        code: "CONFIG_INVALID",
+        message: "registry.host is required when using a dockerfile".to_string(),
+    })?;
+    let version_bytes = image_config.version.as_deref().unwrap_or("1").as_bytes();
+
+    let mut hasher = Sha256::new();
+    hasher.update(dockerfile_bytes);
+    hasher.update(version_bytes);
+    let hash = hasher.finalize();
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hash[..]);
+    // SHA-256 → 32 bytes → base64url (no pad) → 43 chars; [..12] is always in range.
+    let sha = &b64[..12];
+
+    Ok(format!("{host}/{ns_repo}:{sha}"))
 }
 
 /// Load the `[sandbox]` section from the user-level config file
@@ -516,6 +622,13 @@ fn parse_mount_flags(opts: &str, vol: &str) -> Result<MountFlags, SodagunError> 
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
+fn raw_registry_to_config(raw: RawRegistryConfig) -> RegistryConfig {
+    RegistryConfig {
+        host: raw.host,
+        insecure: raw.insecure,
+    }
+}
+
 /// Returns `$XDG_CONFIG_HOME/sodagun/<filename>` or `$HOME/.config/sodagun/<filename>`.
 /// Returns `None` when neither env var is set — that means no user config directory is
 /// available, which callers treat as "no user config" (not an error).
@@ -539,85 +652,69 @@ fn validate_image_config(
     raw: RawImageConfig,
     config_path: &Path,
 ) -> Result<ImageConfig, SodagunError> {
-    // Exactly one of base_image / base_snapshot
-    match (&raw.base_image, &raw.base_snapshot) {
-        (None, None) => {
-            return Err(SodagunError {
-                code: "CONFIG_INVALID",
-                message: "one of 'base_image' or 'base_snapshot' is required in [image]"
-                    .to_string(),
-            });
-        }
-        (Some(_), Some(_)) => {
-            return Err(SodagunError {
-                code: "CONFIG_INVALID",
-                message: "'base_image' and 'base_snapshot' are mutually exclusive in [image]"
-                    .to_string(),
-            });
-        }
-        _ => {}
-    }
+    let has_base_image = raw.base_image.is_some();
+    let has_base_snapshot = raw.base_snapshot.is_some();
+    let has_dockerfile = raw.dockerfile.is_some();
 
-    // At most one of setup_script / setup_script_path
-    if raw.setup_script.is_some() && raw.setup_script_path.is_some() {
+    // dockerfile is mutually exclusive with base_image and base_snapshot
+    if has_dockerfile && has_base_image {
         return Err(SodagunError {
             code: "CONFIG_INVALID",
-            message: "'setup_script' and 'setup_script_path' are mutually exclusive in [image]"
+            message: "'dockerfile' and 'base_image' are mutually exclusive in [image]".to_string(),
+        });
+    }
+    if has_dockerfile && has_base_snapshot {
+        return Err(SodagunError {
+            code: "CONFIG_INVALID",
+            message: "'dockerfile' and 'base_snapshot' are mutually exclusive in [image]"
                 .to_string(),
         });
     }
 
-    // Resolve setup_script_path → script content
-    let setup_script = if let Some(ref script_path) = raw.setup_script_path {
-        let abs = config_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(script_path);
-        let content = std::fs::read_to_string(&abs).map_err(|e| SodagunError {
-            code: "CONFIG_INVALID",
-            message: format!("failed to read setup_script_path '{}': {e}", abs.display()),
-        })?;
-        Some(content)
-    } else {
-        raw.setup_script
-    };
+    // Without dockerfile, exactly one of base_image / base_snapshot is required
+    if !has_dockerfile {
+        match (&raw.base_image, &raw.base_snapshot) {
+            (None, None) => {
+                return Err(SodagunError {
+                    code: "CONFIG_INVALID",
+                    message: "one of 'base_image', 'base_snapshot', or 'dockerfile' is required in [image]"
+                        .to_string(),
+                });
+            }
+            (Some(_), Some(_)) => {
+                return Err(SodagunError {
+                    code: "CONFIG_INVALID",
+                    message: "'base_image' and 'base_snapshot' are mutually exclusive in [image]"
+                        .to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
 
-    // Resolve setup_files paths → SetupFile { name, content }
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    let mut setup_files = Vec::new();
-    for path_str in raw.setup_files.unwrap_or_default() {
-        let abs = config_dir.join(&path_str);
-        let name = abs
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| SodagunError {
-                code: "CONFIG_INVALID",
-                message: format!("setup_files entry '{path_str}' has a non-UTF-8 basename"),
-            })?
-            .to_string();
-        // The setup script is injected under this same basename; a collision would
-        // overwrite one with the other.
-        if name == SETUP_SCRIPT_NAME {
+    // Resolve dockerfile path
+    let dockerfile = if let Some(ref df_path) = raw.dockerfile {
+        let abs = config_path.parent().unwrap_or(Path::new(".")).join(df_path);
+        if !abs.is_file() {
             return Err(SodagunError {
                 code: "CONFIG_INVALID",
                 message: format!(
-                    "setup_files entry '{path_str}' uses reserved name '{SETUP_SCRIPT_NAME}'"
+                    "dockerfile '{}' does not exist or is not a file",
+                    abs.display()
                 ),
             });
         }
-        let content = std::fs::read(&abs).map_err(|e| SodagunError {
-            code: "CONFIG_INVALID",
-            message: format!("failed to read setup_files entry '{}': {e}", abs.display()),
-        })?;
-        setup_files.push(SetupFile { name, content });
-    }
+        Some(abs)
+    } else {
+        None
+    };
 
     Ok(ImageConfig {
         base_image: raw.base_image,
         base_snapshot: raw.base_snapshot,
-        setup_script,
-        setup_files,
-        env: raw.env,
+        dockerfile,
+        namespace_repository: raw.namespace_repository,
+        version: raw.version,
     })
 }
 

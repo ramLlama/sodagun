@@ -12,7 +12,6 @@ mod workspace;
 
 use commands::git::GitCommand;
 use commands::sandbox::SandboxCommand;
-use commands::snapshot::SnapshotCommand;
 use context::{Context, OutputFormat};
 use error::handle_error;
 
@@ -48,8 +47,6 @@ enum Commands {
     Git(GitCommand),
     /// Sandbox utilities.
     Sandbox(SandboxCommand),
-    /// Snapshot utilities.
-    Snapshot(SnapshotCommand),
 }
 
 /// Walk up from CWD to find the project root, using `sodagun.toml` or `.git/`
@@ -132,7 +129,6 @@ fn main() {
 
     match cli.command {
         Commands::Git(cmd) => commands::git::run(ctx, cmd, project_dir),
-        Commands::Sandbox(cmd) => commands::sandbox::run(ctx, cmd),
-        Commands::Snapshot(cmd) => commands::snapshot::run(ctx, cmd, project_dir),
+        Commands::Sandbox(cmd) => commands::sandbox::run(ctx, cmd, project_dir),
     }
 }

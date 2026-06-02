@@ -10,8 +10,8 @@ sodagun [--output text|json] [--quiet] [--project-dir <path>] <subcommand>
 
 Top-level flags (parsed by the `Cli` struct, must precede the subcommand — they are not true globals):
 - `--output text|json` — output format. The selected `OutputFormat` is wrapped in a `Context` (with `quiet`) and passed by value into each handler.
-- `--quiet` — suppress progress/log output (`ctx.log`/`ctx.warn` go to stderr and are silenced).
-- `--project-dir <path>` — override the auto-detected project root. By default `find_project_dir()` walks up from CWD looking for `sodagun.toml` or `.git/`; it warns (unless `--quiet`) if `sodagun.toml` is not co-located with `.git`. The resolved `project_dir` is passed to the `git` and `snapshot` handlers.
+- `--quiet` — suppress progress/log output (`ctx.log` goes to stderr and is silenced).
+- `--project-dir <path>` — override the auto-detected project root. By default `find_project_dir()` walks up from CWD looking for `sodagun.toml` or `.git/`; it warns (unless `--quiet`) if `sodagun.toml` is not co-located with `.git`. The resolved `project_dir` is passed to the `git` and `sandbox` handlers.
 
 ### Workspace model
 
@@ -47,7 +47,7 @@ Error code mapping (git2):
 
 ### `sandbox start <workspace-path>`
 
-Reads `sodagun.json` from the workspace, then resolves the project config (explicit `--config` > `<worktree>/sodagun.toml` > `<repo_path>/sodagun.toml` > built-in defaults), merges it with the user-level `~/.config/sodagun/sodagun.toml` via `merge_sandbox_configs()`, loads any custom named network policies, creates a microsandbox via the SDK, persists the sandbox name into `sodagun.json`, and prints the sandbox name. The worktree is bind-mounted at the configured `working_dir`. When `[image]` declares a setup script, it boots from the derived snapshot (which must already exist — see `snapshot create`).
+Reads `sodagun.json` from the workspace, then resolves the project config (explicit `--config` > `<worktree>/sodagun.toml` > `<repo_path>/sodagun.toml` > built-in defaults), merges it with the user-level `~/.config/sodagun/sodagun.toml` via `merge_sandbox_configs()`, loads and merges `[registry]` config and user `[image]` overrides, loads any custom named network policies, creates a microsandbox via the SDK, persists the sandbox name into `sodagun.json`, and prints the sandbox name. The worktree is bind-mounted at the configured `working_dir`. When `[image]` declares a `dockerfile`, `start()` computes the OCI tag via `dockerfile_image_tag()` and `start_async()` boots from it via `builder.image(tag)` (with `builder.registry(|r| r.insecure())` when configured); a `MicrosandboxError::ImageNotFound` hints to run `sandbox create-image` first.
 
 Options:
 - `--config <path>` — config file path (overrides the resolution chain)
@@ -78,7 +78,7 @@ JSON success: `{"status": "ok", "exit_code": N, "stdout": "...", "stderr": "..."
 
 ### `sandbox list`
 
-Lists sodagun-managed sandboxes via `Sandbox::list()`, filtered to names starting with `sodagun` (covers `sodagun_<...>` worktree sandboxes and `sodagun-snap-<...>` ephemeral snapshot builders). When other microsandbox VMs are filtered out, logs `N non-sodagun sandbox(es) hidden; run \`msb list\`…` to stderr (so JSON on stdout stays clean).
+Lists sodagun-managed sandboxes via `Sandbox::list()`, filtered to names starting with `sodagun` (the `sodagun_<...>` worktree sandboxes). When other microsandbox VMs are filtered out, logs `N non-sodagun sandbox(es) hidden; run \`msb list\`…` to stderr (so JSON on stdout stays clean).
 
 Text success: aligned `NAME` / `STATUS` table (status lowercased).
 JSON success: `{"status": "ok", "sandboxes": [{"name": "...", "status": "running"}, ...]}`
@@ -104,53 +104,32 @@ Options:
 Text success: `"Removed."`
 JSON success: `{"status": "ok"}`
 
-### `snapshot create`
+### `sandbox create-image`
 
-Builds a deterministically named snapshot by running the `[image]` setup script inside an ephemeral sandbox, then snapshotting it. Snapshot name: `<sanitized-base>_<12-char-sha256>`. `sandbox start` automatically boots from this snapshot when `[image]` configures a setup script; it errors with a hint if the snapshot hasn't been created yet.
-
-Options:
-- `--config <path>` — config file path (default: `<project-dir>/sodagun.toml`)
-- `--force` — recreate even if the snapshot already exists
-
-The ephemeral builder is sized by `snapshot_build_resources()`: half of total system RAM and all-but-two logical CPUs (minimum 1; unknown parallelism falls back to 1). It always runs with `NetworkPolicy::allow_all()` and an 8 GiB tmpfs `/tmp`.
-
-JSON success: `{"status": "ok", "snapshot_name": "...", "already_existed": false}`
-
-### `snapshot remove`
-
-Resolves the derived snapshot name from the `[image]` config and removes it via `Snapshot::remove(name)`.
+Builds an OCI image from a `Dockerfile` declared in `[image].dockerfile`, then pushes it to the configured registry. Loads the project `[image]` and `[registry]` config, merges in the user-level `[registry]` config (`merge_registry_configs`) and user `[image]` overrides (`merge_user_image_config`: `namespace_repository`, `version`), and computes the OCI tag via `dockerfile_image_tag()`.
 
 Options:
 - `--config <path>` — config file path (default: `<project-dir>/sodagun.toml`)
-- `-f` / `--force` — succeed silently if the snapshot does not exist
+- `--force` — rebuild/repush even if the image already exists in the registry
 
-JSON success: `{"status": "ok"}`
+Flow: unless `--force`, checks existence with `podman manifest inspect <tag>` (skips the build if it succeeds); otherwise runs `podman build -f <dockerfile> -t <tag> <context_dir>` then `podman push <tag>`. The Dockerfile's parent directory is the build context.
 
-### `snapshot clean`
+JSON success: `{"status": "ok", "image_tag": "...", "already_existed": false}`
+JSON error: `{"status": "error", "code": "<CODE>"}`
 
-Lists all snapshots, opens each to read labels, and removes those tagged `created_by=sodagun` AND `repo_path=<canonical project dir>`.
+Error codes: `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `IMAGE_BUILD_ERROR`
 
-Options:
-- `--config <path>` — config file path (default: `<project-dir>/sodagun.toml`)
-
-JSON success: `{"status": "ok", "removed": ["..."]}`
-
-### Snapshot error codes
-
-`CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `SNAPSHOT_NOT_FOUND`, `SNAPSHOT_ERROR`
-
-- `SNAPSHOT_NOT_FOUND` — named snapshot does not exist (maps `MicrosandboxError::SnapshotNotFound`); emitted by `remove` (without `--force`), by `clean`, and by `sandbox start` when the derived snapshot is missing
-- `SNAPSHOT_ERROR` — SDK failure during ephemeral sandbox creation, script execution, snapshotting, or remove
+- `IMAGE_BUILD_ERROR` — `podman build` or `podman push` failed (non-zero exit or spawn failure)
 
 ### Sandbox / workspace error codes
 
-`WORKSPACE_NOT_FOUND`, `WORKSPACE_INVALID`, `WORKTREE_NOT_FOUND`, `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `SANDBOX_NOT_STARTED`, `SANDBOX_ALREADY_STARTED`, `SANDBOX_NOT_FOUND`, `SANDBOX_ERROR`
+`WORKSPACE_NOT_FOUND`, `WORKSPACE_INVALID`, `WORKTREE_NOT_FOUND`, `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `SANDBOX_NOT_STARTED`, `SANDBOX_ALREADY_STARTED`, `SANDBOX_NOT_FOUND`, `SANDBOX_ERROR`, `IMAGE_BUILD_ERROR`
 
 - `WORKSPACE_NOT_FOUND` — no `sodagun.json` in the given rootdir (was it created by sodagun?)
 - `WORKSPACE_INVALID` — `sodagun.json` is malformed, unreadable, or fails to serialize/write
 - `WORKTREE_NOT_FOUND` — the worktree path recorded in `sodagun.json` does not exist or is not a directory
 - `CONFIG_NOT_FOUND` — `sodagun.toml` missing from the config path
-- `CONFIG_INVALID` — malformed TOML (incl. user `sodagun.toml` / `network-policies.toml`); missing `base_image`/`base_snapshot` in `[image]`; both set together; `setup_script`+`setup_script_path` conflict; a missing/unreadable `setup_files` entry; a `setup_files` entry with a non-UTF-8 basename or the reserved name `_setup`; env/secret key conflict (after merge); `cpus` out of `u8` range; bad volume format; `$HOME` not set for `~` expansion; unresolvable `value_from_env`; `value_from_cmd` exits non-zero; a resolved env/secret value containing control characters; not exactly one of `value`/`value_from_env`/`value_from_cmd` set; unknown network policy name; a reserved policy name redefined in `network-policies.toml`; the old `[sandbox.network].mode` key (rejected via `deny_unknown_fields`); non-UTF-8 paths
+- `CONFIG_INVALID` — malformed TOML (incl. user `sodagun.toml` / `network-policies.toml`); in `[image]`: without `dockerfile`, missing `base_image`/`base_snapshot` (or both set together); `dockerfile` set together with `base_image` or `base_snapshot`; `dockerfile` set but `namespace_repository` absent; `dockerfile` path missing or not a file; `registry.host` absent when `dockerfile` is used (checked at `dockerfile_image_tag()` time); env/secret key conflict (after merge); `cpus` out of `u8` range; bad volume format; `$HOME` not set for `~` expansion; unresolvable `value_from_env`; `value_from_cmd` exits non-zero; a resolved env/secret value containing control characters; not exactly one of `value`/`value_from_env`/`value_from_cmd` set; unknown network policy name; a reserved policy name redefined in `network-policies.toml`; the old `[sandbox.network].mode` key (rejected via `deny_unknown_fields`); non-UTF-8 paths
 - `SANDBOX_NOT_STARTED` — workspace has no sandbox recorded in `sodagun.json` (emitted by `attach`/`exec`/`stop`/`remove` when `sandbox_name` is null)
 - `SANDBOX_ALREADY_STARTED` — `sandbox start` called on a workspace that already has a sandbox recorded
 - `SANDBOX_NOT_FOUND` — named sandbox does not exist (maps `MicrosandboxError::SandboxNotFound`)
@@ -161,17 +140,14 @@ JSON success: `{"status": "ok", "removed": ["..."]}`
 
 ```toml
 [image]
-base_image = "debian"         # or base_snapshot = "name" (mutually exclusive; exactly one required)
-setup_script = """
-#!/usr/bin/env bash
-set -e
-apt-get install -y git
-"""
-# setup_script_path = "./setup.sh"  # alternative to inline setup_script (mutually exclusive)
-setup_files = ["rust-toolchain.toml", "Cargo.toml"]  # paths relative to config file; injected into /setup-assets/ during snapshot create
+base_image = "debian"         # or base_snapshot = "name" (mutually exclusive; exactly one required when no dockerfile)
+# dockerfile = "./Dockerfile"  # build an OCI image via `sandbox create-image` (mutually exclusive with base_image/base_snapshot); path relative to config file
+# namespace_repository = "myorg/myrepo"  # required when dockerfile is set
+# version = "1"                # optional; defaults to "1" at tag-compute time
 
-[image.env]
-HOME = "/root"                # env vars for the ephemeral build sandbox during snapshot create
+[registry]                     # required when dockerfile is used
+host = "registry.example.com"  # required when dockerfile is used (checked at tag-compute time)
+# insecure = true              # optional; allow an insecure/HTTP registry
 
 [sandbox]
 working_dir = "/workspace"  # default
@@ -180,7 +156,7 @@ cpus = 1                    # default; type u8 (serde rejects values > 255 at pa
 volumes = ["~/.config/claude:/root/.config/claude:ro,noexec"]  # "host:guest" or "host:guest:OPTIONS" (comma-separated: ro, rw, noexec)
 
 [sandbox.network]
-policy = "none"   # built-in (none / allow-all / public-only) or a custom name from network-policies.toml. This repo's own sodagun.toml uses none (deps are pre-fetched into the snapshot via setup_files + cargo fetch)
+policy = "none"   # built-in (none / allow-all / public-only) or a custom name from network-policies.toml. This repo's own sodagun.toml uses none (deps are baked into the image via the Dockerfile)
 # default_egress / default_ingress = "allow" | "deny"  # optional inline overrides
 # [[sandbox.network.rules]]  # optional inline rules (same shape as named-policy rules; see below)
 
@@ -197,11 +173,13 @@ allowed_hosts = ["api.anthropic.com"]
 
 Two optional **user-level** config files live under `$XDG_CONFIG_HOME/sodagun/` (falling back to `$HOME/.config/sodagun/`; resolved by `config_path(filename)`):
 
-`~/.config/sodagun/sodagun.toml` — a user-level `[sandbox]` config (no `[image]` section; silently ignored if present). Loaded by `load_user_sandbox_config()` and merged with the project `[sandbox]` via `merge_sandbox_configs()`:
+`~/.config/sodagun/sodagun.toml` — a user-level config supporting a `[sandbox]` section, a `[registry]` section, and an `[image]` section (the latter only honoring `namespace_repository` and `version` — other `[image]` fields are ignored at the user level). Loaded by `load_user_sandbox_config()` / `load_user_registry_config()` / `load_user_image_config()`. The `[sandbox]` section is merged with the project `[sandbox]` via `merge_sandbox_configs()`:
 - `volumes`: user first, then project appended
 - `env` / `secrets`: union; project wins on key conflict
 - Scalars (`working_dir`, `memory_mb`, `cpus`): project > user > built-in default
 - `network.policy` / `default_egress` / `default_ingress`: project > user; `network.rules`: user inline first, then project inline
+
+The `[registry]` section is merged with the project `[registry]` via `merge_registry_configs()` (project wins per-field); the `[image]` overrides via `merge_user_image_config()` (project `namespace_repository`/`version` win when set, else user value).
 
 `~/.config/sodagun/network-policies.toml` — custom named network policies (loaded by `load_network_policies()`). Each top-level table is a policy name:
 ```toml
@@ -218,14 +196,14 @@ ports = [443]              # optional
 ```
 The built-in names in `RESERVED_POLICY_NAMES` (`none`, `allow-all`, `public-only`) are always available and **cannot** be redefined in this file (`CONFIG_INVALID` if attempted).
 
-Note: snapshot-build sizing (memory/cpus for the ephemeral builder) is derived from the host, not from `[image]` — there are no `memory_mb`/`cpus` keys under `[image]`. The `[image]` table accepts only `base_image`, `base_snapshot`, `setup_script`, `setup_script_path`, `setup_files`, and `env`.
+Note: the `[image]` table accepts only `base_image`, `base_snapshot`, `dockerfile`, `namespace_repository`, and `version`; the `[registry]` table accepts `host` and `insecure`.
 
 `[image]` key invariants:
-- Exactly one of `base_image` / `base_snapshot` is required; they are mutually exclusive
-- At most one of `setup_script` / `setup_script_path`; they are mutually exclusive
-- `setup_script_path` is resolved relative to the config file at load time
-- `setup_files` is a list of paths relative to the config file; each is resolved at load time into a `SetupFile { name, content }` (basename + raw bytes) and injected into `/setup-assets/<name>` via a patch during snapshot creation. A missing/unreadable entry, a non-UTF-8 basename, or the reserved basename `_setup` (= `config::SETUP_SCRIPT_NAME`, the slot the setup script itself occupies) is `CONFIG_INVALID`
-- Snapshot name is `<sanitized-base>_<first-12-base64url-chars-of-sha256(script + setup_files)>`; setup file contents are hashed sorted by name, so the name is deterministic given the same base + script + setup_files. `dashify` produces the sanitized base. The hash covers the script bytes and setup_files (name + content), not the guest paths
+- `dockerfile` is mutually exclusive with both `base_image` and `base_snapshot` (`CONFIG_INVALID` if set together)
+- When `dockerfile` is absent, exactly one of `base_image` / `base_snapshot` is required; they are mutually exclusive
+- When `dockerfile` is set, `namespace_repository` is required (parse-time `CONFIG_INVALID` if absent) and the `dockerfile` path must exist and be a file (parse-time `CONFIG_INVALID` otherwise); it is resolved relative to the config file at load time
+- `registry.host` is required whenever `dockerfile` is used — validated at `dockerfile_image_tag()` call time (not parse-time), so a `[registry]` with a missing `host` only fails once a dockerfile build/start is attempted
+- The OCI image tag is computed by `dockerfile_image_tag(image_config, registry, dockerfile_bytes)`: deterministic given the same registry host, `namespace_repository`, `version` (defaulting to `"1"`), and Dockerfile contents. Changing the Dockerfile contents or the `version` changes the tag
 
 Sandbox key invariants:
 - `[image]` section is required when `sodagun.toml` exists; `[sandbox]` is optional (all fields have defaults). When no project config is found anywhere, `sandbox start` falls back to `default_image_config()` (alpine:latest, no setup) + `RawSandboxConfig::default()` for the project side — which is still merged with the user-level config, so user `[sandbox]` settings apply even without a project config
@@ -245,23 +223,22 @@ Sandbox key invariants:
 ```
 src/
   main.rs             # clap Cli struct (--output/--quiet/--project-dir), main(), find_project_dir(), dispatch
-  context.rs          # OutputFormat (clap::ValueEnum, Default) + Context { output, quiet }; Context::log()/warn() (stderr, suppressed by --quiet)
+  context.rs          # OutputFormat (clap::ValueEnum, Default) + Context { output, quiet }; Context::log() (stderr, suppressed by --quiet)
   error.rs            # SodagunError (#[derive(Debug)]), handle_error() -> !
   workspace.rs        # WorkspaceMetadata (sodagun.json: version, repo_path, branch, created_at, worktree_path, sandbox_name) + new()/read()/write()/set_sandbox_name()
-  config.rs           # sodagun.toml parser; ImageConfig (incl. setup_files: Vec<SetupFile>, env), SetupFile { name, content }, RawSandboxConfig (Option scalars, for parse+merge) / SandboxConfig (resolved), NetworkConfig (policy: Option<String>, default_egress/ingress, rules), NetworkRule, NamedPolicy, EnvValue (untagged Literal|Dynamic), ValueSource, SecretConfig, ConfigAction/Direction/Protocol, SETUP_SCRIPT_NAME, RESERVED_POLICY_NAMES, load_config() (→ ImageConfig + RawSandboxConfig), load_image_config(), load_user_sandbox_config(), load_network_policies(), merge_sandbox_configs(), config_path(), snapshot_name(), parse_volume(), default_image_config()
-  util.rs             # dashify() name sanitizer + the microsandbox SDK↔sodagun layer: get_runtime() (OnceLock singleton), map_sandbox_err(), map_snapshot_err(), status_label()
+  config/             # sodagun.toml parser (submodule). ImageConfig { base_image, base_snapshot, dockerfile: Option<PathBuf>, namespace_repository: Option<String>, version: Option<String> }, RegistryConfig { host: Option<String>, insecure: Option<bool> }, UserImageConfig { namespace_repository, version }, RawSandboxConfig (Option scalars, for parse+merge) / SandboxConfig (resolved), NetworkConfig (policy: Option<String>, default_egress/ingress, rules), NetworkRule, NamedPolicy, EnvValue (untagged Literal|Dynamic), ValueSource, SecretConfig, ConfigAction/Direction/Protocol, RESERVED_POLICY_NAMES; load_config() (→ ImageConfig + RawSandboxConfig), load_registry_config(), load_user_sandbox_config(), load_user_registry_config(), load_user_image_config()/load_user_image_config_from_path(), load_network_policies(), merge_sandbox_configs(), merge_registry_configs(), merge_user_image_config(), dockerfile_image_tag(), config_path(), parse_volume(), default_image_config()
+  util.rs             # dashify() name sanitizer + the microsandbox SDK↔sodagun layer: get_runtime() (OnceLock singleton), map_sandbox_err(), status_label()
   commands/
-    mod.rs
+    mod.rs            # pub mod git; pub mod sandbox;
     git.rs            # GitCommand sub-app; add_worktree logic
-    sandbox.rs        # SandboxCommand sub-app; start()/attach()/exec()/list()/stop()/remove() + private async impls, read_sandbox_name(); value resolution (run_value_cmd, validate_value_str, resolve_value_source, resolve_env_value, resolve_secret_value) + network-policy building (apply_named_policy, apply_rule, commit_dest, to_sdk_action)
-    snapshot.rs       # SnapshotCommand sub-app; create()/remove()/clean() + async impls, snapshot_build_resources(), SETUP_ASSETS_DIR
+    sandbox.rs        # SandboxCommand sub-app; run(project_dir); start()/attach()/exec()/list()/stop()/remove()/create-image() + private async impls, read_sandbox_name(); value resolution (run_value_cmd, validate_value_str, resolve_value_source, resolve_env_value, resolve_secret_value) + network-policy building (apply_named_policy, apply_rule, commit_dest, to_sdk_action)
 tests/
   integration.rs              # entry point: `mod integration { automod::dir!("tests/integration"); }` auto-discovers every file below as one shared test binary
   integration/
     test_add_worktree.rs
     test_sandbox_start.rs
     test_sandbox_lifecycle.rs
-    test_snapshot.rs
+    test_sandbox_create_image.rs
 Cargo.toml
 deny.toml             # cargo-deny policy (permissive license allowances + microsandbox advisory ignores)
 Makefile
@@ -269,7 +246,7 @@ Makefile
 ```
 
 Key invariants:
-- Top-level flags (`--output`/`--quiet`/`--project-dir`) must precede the subcommand (not true globals); `Context { output, quiet }` is constructed in `main()` and passed by value into each handler. `project_dir` is resolved by `find_project_dir()` and passed to the `git`/`snapshot` handlers
+- Top-level flags (`--output`/`--quiet`/`--project-dir`) must precede the subcommand (not true globals); `Context { output, quiet }` is constructed in `main()` and passed by value into each handler. `project_dir` is resolved by `find_project_dir()` and passed to the `git`/`sandbox` handlers (`sandbox::run(project_dir)`, mirroring `git::run`)
 - `handle_error()` returns `!` (Never type) — always calls `std::process::exit(1)` after printing; the Rust equivalent of Python's `NoReturn`
 - Text errors go to stderr (`eprintln!`); JSON errors go to stdout (`println!`) so `--output json` output is always parseable. `get_runtime()` and `find_project_dir()` are the deliberate exceptions: their pre-command failures exit via plain stderr without a JSON envelope
 - `git2::Repository::worktree()` requires the target path to not pre-exist; the worktree name stored under `.git/worktrees/` is the dashified branch (git can't nest dirs there)
@@ -278,9 +255,9 @@ Key invariants:
 - Top-level error handling uses the `handle_error(ctx, SodagunError { code, message }) -> !` pattern rather than `?` / `Result` propagation, so error codes and exit semantics stay explicit
 - `sandbox attach` and `sandbox exec` exit with the inner process's exit code on success (via `std::process::exit()`), not a fixed code
 - Async SDK calls are bridged to the synchronous handlers with the shared `util::get_runtime()` runtime; the `*_async` functions own all `.await`s and are private to their command module
-- `util::map_sandbox_err()` maps `SandboxNotFound` → `SANDBOX_NOT_FOUND` (else `SANDBOX_ERROR`); `util::map_snapshot_err()` maps `SnapshotNotFound` → `SNAPSHOT_NOT_FOUND` (else `SNAPSHOT_ERROR`)
+- `util::map_sandbox_err()` maps `SandboxNotFound` → `SANDBOX_NOT_FOUND` (else `SANDBOX_ERROR`)
 - Stop/wait is delegated to the SDK: `stop`/`remove` call `SandboxHandle::stop_with_timeout(timeout)` to send a graceful shutdown and wait for the sandbox to halt. The `--no-wait` path uses `tokio::spawn` to fire the stop off without awaiting it
-- `snapshot create` builds the ephemeral sandbox with `.patch(...)`: the setup script is patched to `/setup-assets/_setup` (mode `0o755`; `_setup` = `config::SETUP_SCRIPT_NAME`, leading underscore avoids colliding with user `setup_files`), and each `setup_files` entry to `/setup-assets/<name>`. The script runs directly via `exec_stream("/setup-assets/_setup", …)`. Before snapshotting it runs `sync`, then `stop_and_wait()`. The resulting snapshot carries labels `created_by=sodagun`, `repo_path`, `setup_hash` (the 12-char base64url suffix of the name), and `source_image` — `repo_path` is what `snapshot clean` filters on
+- `sandbox create-image` shells out to `podman` (not the microsandbox SDK): `podman manifest inspect <tag>` for the existence check, then `podman build -f <dockerfile> -t <tag> <context_dir>` and `podman push <tag>`. A non-zero exit or spawn failure on any of these is `IMAGE_BUILD_ERROR`. `sandbox start` boots a dockerfile image with `builder.image(tag)` (+ `builder.registry(|r| r.insecure())` when `registry.insecure` is set); `MicrosandboxError::ImageNotFound` from the SDK is mapped to a `SANDBOX_ERROR` whose message hints to run `sandbox create-image` first
 
 ## Dev workflow
 
@@ -307,17 +284,17 @@ Two release profiles: `release` (fat LTO) and `release-thin` (`inherits = "relea
 - All integration test files use the `sodagun_isolated(xdg_tmp)` helper, which sets `XDG_CONFIG_HOME` to an empty tempdir so tests don't pick up the real user-level config files
 - `test_sandbox_start.rs` — error-path tests (CONFIG_NOT_FOUND, malformed TOML, `[image]` validation errors, text + json) plus `start_creates_sandbox`, a happy-path test that boots a real sandbox (needs hardware virtualization — KVM or Apple Silicon hvf — to pass). Also covers the new `CONFIG_INVALID` paths: `value_from_cmd` non-zero exit, `value_from_cmd` multiline output (rejected), a trailing newline accepted (trimmed), unknown policy name with no policies file, and a reserved policy name redefined in `network-policies.toml`
 - `test_sandbox_lifecycle.rs` — list (JSON shape + text header), and workspace-based stop/remove error paths. Helpers `make_workspace()` / `make_workspace_with_sandbox()` write a `sodagun.json` fixture directly. Includes happy-path tests (`stop_running_sandbox`, `remove_running_sandbox_implicit_stop`) that boot a real sandbox
-- `test_snapshot.rs` — all `[image]` error paths plus an e2e happy-path test that installs git via a setup script and asserts `git version` succeeds in a sandbox booted from the resulting snapshot
+- `test_sandbox_create_image.rs` — error-path tests for `sandbox create-image` (no hardware/podman needed): `CONFIG_NOT_FOUND`, no `dockerfile` in config, dockerfile path not found, dockerfile+`base_image` conflict, dockerfile+`base_snapshot` conflict, missing `namespace_repository`, missing `registry.host` (text and JSON)
 - The happy-path tests above are **not** `#[ignore]`d — they run as part of `cargo test` and pass on a host with hardware virtualization (they will fail without it)
-- `src/config.rs` has `#[cfg(test)]` unit tests covering valid `[image]` configs, defaults, every `CONFIG_INVALID` / `CONFIG_NOT_FOUND` path, `snapshot_name` determinism, `parse_volume` (including tilde expansion + the `$HOME`-unset path, which mutates the env var under a mutex), the rejection of the old `mode` field, `EnvValue`/`value_from_cmd` parsing, `merge_sandbox_configs` semantics, and `load_network_policies` (valid/malformed/reserved-name)
+- `src/config/tests.rs` has `#[cfg(test)]` unit tests covering valid `[image]` configs, defaults, every `CONFIG_INVALID` / `CONFIG_NOT_FOUND` path, dockerfile config validation, `parse_volume` (including tilde expansion + the `$HOME`-unset path, which mutates the env var under a mutex), the rejection of the old `mode` field, `EnvValue`/`value_from_cmd` parsing, `merge_sandbox_configs` semantics, `merge_registry_configs`, `load_user_image_config` / `merge_user_image_config`, `dockerfile_image_tag` (determinism, content change, version change, format, missing-host error, missing-`namespace_repository` error), and `load_network_policies` (valid/malformed/reserved-name)
 - `src/commands/sandbox.rs` has `#[cfg(test)]` unit tests for `apply_rule` (domain/CIDR) and `apply_named_policy` (from file, unknown built-in, unknown-in-file, built-in works with file present, and `public-only` matching the SDK preset)
 - `src/util.rs` unit-tests `dashify`; `src/commands/git.rs` unit-tests the rootdir naming contract; `src/workspace.rs` unit-tests the `sodagun.json` roundtrip
 
 ## Dependencies
 
-Runtime: `clap` (derive), `git2` (`vendored-libgit2`), `microsandbox` (0.4), `serde` + `serde_json`, `toml`, `tokio` (`rt-multi-thread`, `time`), `uuid` (v4), `chrono` (`clock`), `colored`, `sha2` (0.11), `base64` (0.22), `sysinfo` (0.33, `system` feature only)
+Runtime: `clap` (derive), `git2` (`vendored-libgit2`), `microsandbox` (0.4), `serde` + `serde_json`, `toml`, `tokio` (`rt-multi-thread`, `time`), `uuid` (v4), `chrono` (`clock`), `colored`, `sha2` (0.11), `base64` (0.22)
 Dev: `assert_cmd`, `predicates`, `tempfile`, `automod`
-0.x dependencies are pinned to a minor version (`sha2 = "0.11"`, `base64 = "0.22"`, `sysinfo = "0.33"`).
+0.x dependencies are pinned to a minor version (`sha2 = "0.11"`, `base64 = "0.22"`).
 Supply chain: `cargo-deny` + `cargo-audit` wired into pre-commit and `make audit`; `Cargo.lock` is committed. `deny.toml` allows additional permissive licenses (ISC, BSD-3-Clause, 0BSD, CDLA-Permissive-2.0, etc.) and ignores specific advisories pulled in by `microsandbox` transitive deps; `make audit` mirrors those ignores with `--ignore` flags.
 
 ## Style

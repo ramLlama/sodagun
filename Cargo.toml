@@ -23,7 +23,6 @@ uuid         = { version = "1", features = ["v4"] }
 colored      = "3"
 sha2         = "0.11"
 base64       = "0.22"
-sysinfo      = { version = "0.33", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 assert_cmd = "2"

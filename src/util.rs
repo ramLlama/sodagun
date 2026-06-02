@@ -1,10 +1,7 @@
 //! Small cross-cutting helpers shared across commands.
 //!
-//! This also currently houses the microsandbox SDK ↔ sodagun translation layer
-//! (error/status mapping plus the shared tokio runtime), so those mappings stay
-//! consistent across the `sandbox` and `snapshot` commands instead of being
-//! duplicated per file. Once the microsandbox-specific helpers grow, split them
-//! out into a dedicated module.
+//! Houses the microsandbox SDK ↔ sodagun translation layer (error/status mapping
+//! plus the shared tokio runtime), keeping those mappings consistent across commands.
 
 use std::sync::OnceLock;
 
@@ -136,22 +133,6 @@ pub fn map_sandbox_err(e: MicrosandboxError, sandbox_name: &str) -> SodagunError
     } else {
         SodagunError {
             code: "SANDBOX_ERROR",
-            message: format!("{e}"),
-        }
-    }
-}
-
-/// Maps a microsandbox error from a snapshot operation: an unknown snapshot name
-/// becomes `SNAPSHOT_NOT_FOUND`, everything else `SNAPSHOT_ERROR`.
-pub fn map_snapshot_err(e: MicrosandboxError, snapshot_name: &str) -> SodagunError {
-    if matches!(e, MicrosandboxError::SnapshotNotFound(_)) {
-        SodagunError {
-            code: "SNAPSHOT_NOT_FOUND",
-            message: format!("snapshot '{snapshot_name}' not found"),
-        }
-    } else {
-        SodagunError {
-            code: "SNAPSHOT_ERROR",
             message: format!("{e}"),
         }
     }
