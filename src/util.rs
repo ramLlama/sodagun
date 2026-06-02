@@ -15,6 +15,74 @@ use tokio::runtime::Runtime;
 
 use crate::error::SodagunError;
 
+// ── msb version guard ─────────────────────────────────────────────────────
+
+/// Minimum `msb` binary version compatible with the `microsandbox` SDK version
+/// in Cargo.toml. Update the minor when upgrading the SDK past a breaking
+/// protocol change (the binary must be at least this version).
+const REQUIRED_MSB_VERSION: (u32, u32, u32) = (0, 5, 0);
+
+/// Verify that the resolved `msb` binary is at least [`REQUIRED_MSB_VERSION`].
+///
+/// The SDK resolution order prefers `~/.microsandbox/bin/msb` over the system
+/// PATH, so a stale system-managed binary can silently shadow a current one and
+/// produce cryptic protocol errors. Checking early surfaces a clear
+/// "run: msb self update" message before any SDK call is made.
+pub fn check_msb_version() -> Result<(), SodagunError> {
+    let msb_path = microsandbox::config::resolve_msb_path().map_err(|e| SodagunError {
+        code: "SANDBOX_ERROR",
+        message: format!("could not resolve msb binary: {e}"),
+    })?;
+
+    let output = std::process::Command::new(&msb_path)
+        .arg("--version")
+        .output()
+        .map_err(|e| SodagunError {
+            code: "SANDBOX_ERROR",
+            message: format!("failed to run `msb --version`: {e}"),
+        })?;
+
+    // Output is "msb X.Y.Z\n"; take the second whitespace token.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version_str = stdout
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| SodagunError {
+            code: "SANDBOX_ERROR",
+            message: format!("unexpected `msb --version` output: {stdout:?}"),
+        })?;
+
+    let actual = parse_msb_version(version_str).ok_or_else(|| SodagunError {
+        code: "SANDBOX_ERROR",
+        message: format!("could not parse `msb --version` output: {stdout:?}"),
+    })?;
+
+    if actual < REQUIRED_MSB_VERSION {
+        return Err(SodagunError {
+            code: "SANDBOX_ERROR",
+            message: format!(
+                "msb at {} is version {version_str}, but sodagun requires >= {}.{}.{} — \
+                 run: msb self update",
+                msb_path.display(),
+                REQUIRED_MSB_VERSION.0,
+                REQUIRED_MSB_VERSION.1,
+                REQUIRED_MSB_VERSION.2,
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Parse a dotted version string (e.g. `"0.5.4"`) into a comparable triple.
+fn parse_msb_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
 // ── Name sanitization ──────────────────────────────────────────────────────
 
 /// Characters collapsed to `-` by [`dashify`]. `_` and `/` are structural
@@ -116,5 +184,33 @@ mod tests {
     fn dashify_preserves_dots_and_hyphens() {
         // `.` and existing `-` are not separators, so they survive.
         assert_eq!(dashify("v1.2.3-rc1"), "v1.2.3-rc1");
+    }
+
+    #[test]
+    fn parse_msb_version_full() {
+        assert_eq!(parse_msb_version("0.5.4"), Some((0, 5, 4)));
+        assert_eq!(parse_msb_version("1.0.0"), Some((1, 0, 0)));
+        assert_eq!(parse_msb_version("0.4.6"), Some((0, 4, 6)));
+    }
+
+    #[test]
+    fn parse_msb_version_two_components_defaults_patch_to_zero() {
+        assert_eq!(parse_msb_version("0.5"), Some((0, 5, 0)));
+    }
+
+    #[test]
+    fn parse_msb_version_invalid_returns_none() {
+        assert_eq!(parse_msb_version(""), None);
+        assert_eq!(parse_msb_version("abc"), None);
+        assert_eq!(parse_msb_version("v0.5.4"), None); // leading 'v' is not a digit
+    }
+
+    #[test]
+    fn msb_version_comparison() {
+        // Ensure tuple ordering matches semver expectations used in the guard.
+        assert!((0, 5, 4) >= REQUIRED_MSB_VERSION); // current
+        assert!((0, 4, 6) < REQUIRED_MSB_VERSION); // old system binary
+        assert!((0, 6, 0) >= REQUIRED_MSB_VERSION); // future minor
+        assert!((1, 0, 0) >= REQUIRED_MSB_VERSION); // future major
     }
 }

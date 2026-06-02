@@ -14,6 +14,7 @@ use commands::git::GitCommand;
 use commands::sandbox::SandboxCommand;
 use commands::snapshot::SnapshotCommand;
 use context::{Context, OutputFormat};
+use error::handle_error;
 
 #[derive(Parser)]
 #[command(
@@ -127,6 +128,7 @@ fn main() {
         quiet: cli.quiet,
     };
     let project_dir = find_project_dir(cli.project_dir, cli.quiet);
+    util::check_msb_version().unwrap_or_else(|e| handle_error(ctx, e));
 
     match cli.command {
         Commands::Git(cmd) => commands::git::run(ctx, cmd, project_dir),
