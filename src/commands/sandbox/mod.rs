@@ -1,17 +1,19 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{
-    ImageConfig, NamedPolicy, RawSandboxConfig, SandboxConfig, load_network_policies,
-    load_user_sandbox_config, merge_sandbox_configs, parse_volume,
+    ImageConfig, NamedPolicy, RawSandboxConfig, RegistryConfig, SandboxConfig,
+    load_network_policies, load_registry_config, load_user_image_config, load_user_registry_config,
+    load_user_sandbox_config, merge_registry_configs, merge_sandbox_configs,
+    merge_user_image_config, parse_volume,
 };
 use crate::context::{Context, OutputFormat};
 use crate::error::{SodagunError, handle_error};
 use crate::util;
 use crate::workspace::WorkspaceMetadata;
 use clap::{Parser, Subcommand};
-use microsandbox::{MicrosandboxError, NetworkPolicy, Sandbox, Snapshot};
+use microsandbox::{MicrosandboxError, NetworkPolicy, Sandbox};
 
 mod network;
 mod values;
@@ -21,9 +23,8 @@ use self::values::{resolve_env_value, resolve_secret_value};
 #[cfg(test)]
 mod tests;
 
-/// Name prefix shared by all sodagun-created sandboxes: worktree sandboxes
-/// (`sodagun_<repo>_<branch>_<uuid>`) and ephemeral snapshot builders
-/// (`sodagun-snap-<uuid>`). Used to filter `sandbox list` to our own VMs.
+/// Name prefix shared by all sodagun-created sandboxes (`sodagun_<repo>_<branch>_<uuid>`).
+/// Used to filter `sandbox list` to our own VMs.
 const SODAGUN_PREFIX: &str = "sodagun";
 
 #[derive(Parser)]
@@ -46,6 +47,8 @@ pub enum SandboxSubcommand {
     Stop(StopArgs),
     /// Stop and remove a sandbox.
     Remove(RemoveArgs),
+    /// Build and push a Dockerfile-based image for this project.
+    CreateImage(CreateImageArgs),
 }
 
 #[derive(Parser)]
@@ -112,7 +115,18 @@ pub struct RemoveArgs {
     pub stop_timeout_seconds: u64,
 }
 
-pub fn run(ctx: Context, cmd: SandboxCommand) {
+#[derive(Parser)]
+pub struct CreateImageArgs {
+    /// Path to the config file (default: <project-dir>/sodagun.toml).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
+    /// Force rebuild even if the image tag already exists in the registry.
+    #[arg(long)]
+    pub force: bool,
+}
+
+pub fn run(ctx: Context, cmd: SandboxCommand, project_dir: PathBuf) {
     match cmd.subcommand {
         SandboxSubcommand::Start(args) => start(ctx, args),
         SandboxSubcommand::Attach(args) => attach(ctx, args),
@@ -120,6 +134,7 @@ pub fn run(ctx: Context, cmd: SandboxCommand) {
         SandboxSubcommand::List(args) => list(ctx, args),
         SandboxSubcommand::Stop(args) => stop(ctx, args),
         SandboxSubcommand::Remove(args) => remove(ctx, args),
+        SandboxSubcommand::CreateImage(args) => create_image(ctx, args, project_dir),
     }
 }
 
@@ -191,8 +206,8 @@ fn start(ctx: Context, args: StartArgs) {
         }
     };
 
-    let (image_config, raw_project) = match resolved_config {
-        Some(path) => match crate::config::load_config(&path) {
+    let (image_config, raw_project) = match &resolved_config {
+        Some(path) => match crate::config::load_config(path) {
             Ok(pair) => pair,
             Err(e) => handle_error(ctx, e),
         },
@@ -216,6 +231,11 @@ fn start(ctx: Context, args: StartArgs) {
         Err(e) => handle_error(ctx, e),
     };
 
+    // Load and merge registry + user image overrides (needed for dockerfile path).
+    // Pass resolved_config so --config overrides are honored (not re-derived).
+    let (image_config, registry) =
+        load_and_merge_image_overrides(ctx, &resolved_config, image_config);
+
     // Sandbox name == workspace directory name, enforcing a strict 1:1 worktree↔VM mapping.
     let sandbox_name = args
         .workspace_path
@@ -234,6 +254,26 @@ fn start(ctx: Context, args: StartArgs) {
             )
         });
 
+    // Compute the OCI tag if a dockerfile is configured, so we can pass it into start_async.
+    let dockerfile_tag = if let Some(ref df_path) = image_config.dockerfile {
+        let bytes = std::fs::read(df_path).unwrap_or_else(|e| {
+            handle_error(
+                ctx,
+                SodagunError {
+                    code: "CONFIG_INVALID",
+                    message: format!("failed to read dockerfile '{}': {e}", df_path.display()),
+                },
+            )
+        });
+        let tag = match crate::config::dockerfile_image_tag(&image_config, &registry, &bytes) {
+            Ok(t) => t,
+            Err(e) => handle_error(ctx, e),
+        };
+        Some(tag)
+    } else {
+        None
+    };
+
     // Reserve the sandbox name in metadata BEFORE launching. This way, if the process is
     // interrupted after launch succeeds but before a post-launch write, the name is already
     // persisted and the sandbox is still reachable. If launch fails, we clear it as rollback.
@@ -250,6 +290,8 @@ fn start(ctx: Context, args: StartArgs) {
         &meta.worktree_path,
         &image_config,
         &sandbox_config,
+        &registry,
+        dockerfile_tag.as_deref(),
         &network_policies,
         policies_path.as_deref(),
     )) {
@@ -270,6 +312,37 @@ fn start(ctx: Context, args: StartArgs) {
             )
         }
     }
+}
+
+/// Load registry config and merge user image overrides into `image_config`.
+/// Returns (merged ImageConfig, merged RegistryConfig).
+///
+/// `config_path` is the resolved project config path (or None if defaults were used).
+fn load_and_merge_image_overrides(
+    ctx: Context,
+    config_path: &Option<PathBuf>,
+    image_config: ImageConfig,
+) -> (ImageConfig, RegistryConfig) {
+    let proj_registry = match config_path {
+        Some(path) => match load_registry_config(path) {
+            Ok(r) => r,
+            Err(e) => handle_error(ctx, e),
+        },
+        None => RegistryConfig::default(),
+    };
+    let user_registry = match load_user_registry_config() {
+        Ok(r) => r,
+        Err(e) => handle_error(ctx, e),
+    };
+    let registry = merge_registry_configs(user_registry, proj_registry);
+
+    let user_image = match load_user_image_config() {
+        Ok(u) => u,
+        Err(e) => handle_error(ctx, e),
+    };
+    let image_config = merge_user_image_config(user_image, image_config);
+
+    (image_config, registry)
 }
 
 fn attach(ctx: Context, args: AttachArgs) {
@@ -402,6 +475,155 @@ fn remove(ctx: Context, args: RemoveArgs) {
     }
 }
 
+fn create_image(ctx: Context, args: CreateImageArgs, project_dir: PathBuf) {
+    let config_path = args
+        .config
+        .unwrap_or_else(|| project_dir.join("sodagun.toml"));
+
+    let image_config = match crate::config::load_config(&config_path) {
+        Ok((img, _)) => img,
+        Err(e) => handle_error(ctx, e),
+    };
+
+    // dockerfile is required for create-image
+    let dockerfile_path = match image_config.dockerfile {
+        Some(ref p) => p.clone(),
+        None => handle_error(
+            ctx,
+            SodagunError {
+                code: "CONFIG_INVALID",
+                message:
+                    "no 'dockerfile' in [image] — 'sandbox create-image' requires a dockerfile"
+                        .to_string(),
+            },
+        ),
+    };
+
+    // Load and merge registry config
+    let proj_registry = match load_registry_config(&config_path) {
+        Ok(r) => r,
+        Err(e) => handle_error(ctx, e),
+    };
+    let user_registry = match load_user_registry_config() {
+        Ok(r) => r,
+        Err(e) => handle_error(ctx, e),
+    };
+    let registry = merge_registry_configs(user_registry, proj_registry);
+
+    // Load and merge user image overrides
+    let user_image = match load_user_image_config() {
+        Ok(u) => u,
+        Err(e) => handle_error(ctx, e),
+    };
+    let image_config = merge_user_image_config(user_image, image_config);
+
+    // Read Dockerfile bytes and compute the full OCI tag
+    let dockerfile_bytes = std::fs::read(&dockerfile_path).unwrap_or_else(|e| {
+        handle_error(
+            ctx,
+            SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!(
+                    "failed to read dockerfile '{}': {e}",
+                    dockerfile_path.display()
+                ),
+            },
+        )
+    });
+    let full_tag =
+        match crate::config::dockerfile_image_tag(&image_config, &registry, &dockerfile_bytes) {
+            Ok(t) => t,
+            Err(e) => handle_error(ctx, e),
+        };
+
+    // Check whether the image already exists in the registry
+    let tls = if registry.insecure == Some(true) {
+        "--tls-verify=false"
+    } else {
+        "--tls-verify=true"
+    };
+
+    if !args.force && run_podman(&["manifest", "inspect", tls, &full_tag]).is_ok() {
+        match ctx.output {
+            OutputFormat::Text => println!("Image already exists: {full_tag}"),
+            OutputFormat::Json => println!(
+                "{}",
+                serde_json::json!({
+                    "status": "ok",
+                    "image_tag": full_tag,
+                    "already_existed": true,
+                })
+            ),
+        }
+        return;
+    }
+
+    // Build
+    let context_dir = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_str()
+        .unwrap_or(".");
+    let dockerfile_str = dockerfile_path.to_str().unwrap_or_else(|| {
+        handle_error(
+            ctx,
+            SodagunError {
+                code: "CONFIG_INVALID",
+                message: "dockerfile path contains non-UTF-8 characters".to_string(),
+            },
+        )
+    });
+
+    if let Err(e) = run_podman(&[
+        "build",
+        tls,
+        "-f",
+        dockerfile_str,
+        "-t",
+        &full_tag,
+        context_dir,
+    ]) {
+        handle_error(ctx, e);
+    }
+
+    // Push
+    if let Err(e) = run_podman(&["push", tls, &full_tag]) {
+        handle_error(ctx, e);
+    }
+
+    match ctx.output {
+        OutputFormat::Text => println!("Built and pushed: {full_tag}"),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "image_tag": full_tag,
+                "already_existed": false,
+            })
+        ),
+    }
+}
+
+/// Run a podman subcommand, streaming stdout/stderr to the terminal.
+/// Returns `PODMAN_ERROR` on non-zero exit.
+fn run_podman(args: &[&str]) -> Result<(), SodagunError> {
+    let status = std::process::Command::new("podman")
+        .args(args)
+        .status()
+        .map_err(|e| SodagunError {
+            code: "PODMAN_ERROR",
+            message: format!("failed to run podman: {e}"),
+        })?;
+    if !status.success() {
+        let code = status.code().unwrap_or(-1);
+        return Err(SodagunError {
+            code: "PODMAN_ERROR",
+            message: format!("podman {} exited with code {code}", args[0]),
+        });
+    }
+    Ok(())
+}
+
 /// Lists sodagun-managed sandboxes (those whose name starts with [`SODAGUN_PREFIX`]),
 /// returning them alongside the count of other microsandbox VMs filtered out.
 async fn list_async() -> Result<(Vec<(String, String)>, usize), SodagunError> {
@@ -465,38 +687,29 @@ async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunError>
         .map_err(|e| util::map_sandbox_err(e, name))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_async(
     ctx: Context,
     sandbox_name: &str,
     worktree_path: &std::path::Path,
     image_config: &ImageConfig,
     sandbox_config: &SandboxConfig,
+    registry: &RegistryConfig,
+    // Pre-computed OCI tag when image_config.dockerfile is set.
+    dockerfile_tag: Option<&str>,
     network_policies: &HashMap<String, NamedPolicy>,
     // Some(path) when the user's network-policies.toml file exists; None → use built-ins.
     policies_path: Option<&std::path::Path>,
 ) -> Result<String, SodagunError> {
     let mut builder = Sandbox::builder(sandbox_name);
 
-    // Determine what to boot from. When a setup script is configured, we boot from
-    // the derived snapshot; the snapshot must already exist (run `sodagun snapshot create`).
-    if let Some(snap_name) = image_config.derived_snapshot_name() {
-        Snapshot::get(&snap_name).await.map_err(|e| {
-            if matches!(e, MicrosandboxError::SnapshotNotFound(_)) {
-                SodagunError {
-                    code: "SNAPSHOT_NOT_FOUND",
-                    message: format!(
-                        "snapshot '{snap_name}' not found — run 'sodagun snapshot create <rootdir>' first"
-                    ),
-                }
-            } else {
-                SodagunError {
-                    code: "SNAPSHOT_ERROR",
-                    message: format!("{e}"),
-                }
-            }
-        })?;
-        ctx.log(&format!("booting from project snapshot: {snap_name}"));
-        builder = builder.from_snapshot(&snap_name);
+    // Determine what to boot from.
+    if let Some(tag) = dockerfile_tag {
+        ctx.log(&format!("booting from OCI image: {tag}"));
+        builder = builder.image(tag);
+        if let Some(true) = registry.insecure {
+            builder = builder.registry(|r| r.insecure());
+        }
     } else if let Some(ref image) = image_config.base_image {
         ctx.log(&format!("booting from image: {image}"));
         builder = builder.image(image.as_str());
@@ -599,12 +812,23 @@ async fn start_async(
         });
     }
 
-    let sandbox = builder.create_detached().await.map_err(|e| SodagunError {
-        code: "SANDBOX_ERROR",
-        message: format!("failed to create sandbox: {e}"),
+    builder.create_detached().await.map_err(|e| {
+        // When the image isn't found locally and a dockerfile tag was used,
+        // give a hint to run create-image first.
+        if matches!(e, MicrosandboxError::ImageNotFound(_)) && dockerfile_tag.is_some() {
+            SodagunError {
+                code: "SANDBOX_ERROR",
+                message: format!("image not found — run 'sodagun sandbox create-image' first: {e}"),
+            }
+        } else {
+            SodagunError {
+                code: "SANDBOX_ERROR",
+                message: format!("failed to create sandbox: {e}"),
+            }
+        }
     })?;
 
-    Ok(sandbox.name().to_string())
+    Ok(sandbox_name.to_string())
 }
 
 async fn exec_async(

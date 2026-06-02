@@ -25,8 +25,7 @@ base_image = "alpine:latest"
     let (img, _) = load_config(f.path()).unwrap();
     assert_eq!(img.base_image.as_deref(), Some("alpine:latest"));
     assert!(img.base_snapshot.is_none());
-    assert!(img.setup_script.is_none());
-    assert!(img.derived_snapshot_name().is_none());
+    assert!(img.dockerfile.is_none());
 }
 
 #[test]
@@ -43,61 +42,38 @@ base_snapshot = "my-snap"
 }
 
 #[test]
-fn valid_image_with_inline_script() {
-    let f = write_config(
-        r##"
-[image]
-base_image = "debian"
-setup_script = "#!/bin/bash\napt-get update\n"
-"##,
-    );
-    let (img, _) = load_config(f.path()).unwrap();
-    assert!(img.setup_script.is_some());
-    assert!(img.derived_snapshot_name().is_some());
-}
-
-#[test]
-fn valid_image_with_script_path() {
-    use std::io::Write as _;
-    let script_file = NamedTempFile::new().unwrap();
-    writeln!(script_file.as_file(), "#!/bin/bash\necho hello").unwrap();
-
-    let config_content = format!(
-        "[image]\nbase_image = \"alpine:latest\"\nsetup_script_path = \"{}\"\n",
-        script_file.path().display()
-    );
-    let mut cfg = NamedTempFile::new().unwrap();
+fn valid_image_dockerfile() {
+    let tmp = TempDir::new().unwrap();
+    let df = tmp.path().join("Dockerfile");
+    std::fs::write(&df, "FROM alpine\n").unwrap();
+    let config_content =
+        "[image]\ndockerfile = \"Dockerfile\"\nnamespace_repository = \"org/repo\"\n".to_string();
+    let mut cfg = NamedTempFile::new_in(tmp.path()).unwrap();
     cfg.write_all(config_content.as_bytes()).unwrap();
     let (img, _) = load_config(cfg.path()).unwrap();
-    assert!(img.setup_script.as_deref().unwrap().contains("echo hello"));
+    assert!(img.dockerfile.is_some());
+    assert!(img.dockerfile.as_ref().unwrap().ends_with("Dockerfile"));
+    assert_eq!(img.namespace_repository.as_deref(), Some("org/repo"));
+    assert!(img.base_image.is_none());
+    assert!(img.base_snapshot.is_none());
 }
 
 #[test]
-fn valid_image_env() {
-    let f = write_config(
-        r#"
-[image]
-base_image = "alpine"
-
-[image.env]
-HOME = "/root"
-CUSTOM = "value"
-"#,
-    );
-    let (img, _) = load_config(f.path()).unwrap();
-    assert_eq!(img.env.get("HOME").map(String::as_str), Some("/root"));
-    assert_eq!(img.env.get("CUSTOM").map(String::as_str), Some("value"));
+fn valid_image_dockerfile_with_version() {
+    let tmp = TempDir::new().unwrap();
+    let df = tmp.path().join("Dockerfile");
+    std::fs::write(&df, "FROM alpine\n").unwrap();
+    let config_content =
+        "dockerfile = \"Dockerfile\"\nnamespace_repository = \"org/repo\"\nversion = \"2\"\n";
+    let toml = format!("[image]\n{config_content}");
+    let mut cfg = NamedTempFile::new_in(tmp.path()).unwrap();
+    cfg.write_all(toml.as_bytes()).unwrap();
+    let (img, _) = load_config(cfg.path()).unwrap();
+    assert_eq!(img.version.as_deref(), Some("2"));
 }
 
 #[test]
-fn valid_image_env_defaults_empty() {
-    let f = write_config("[image]\nbase_image = \"alpine\"\n");
-    let (img, _) = load_config(f.path()).unwrap();
-    assert!(img.env.is_empty());
-}
-
-#[test]
-fn error_image_neither_base() {
+fn error_image_neither_base_nor_dockerfile() {
     let f = write_config("[image]\nmemory_mb = 512\n");
     let err = load_config(f.path()).unwrap_err();
     assert_eq!(err.code, "CONFIG_INVALID");
@@ -111,21 +87,53 @@ fn error_image_both_base() {
 }
 
 #[test]
-fn error_image_both_scripts() {
-    let f = write_config(
-        "[image]\nbase_image = \"alpine\"\nsetup_script = \"#!/bin/sh\"\nsetup_script_path = \"./s.sh\"\n",
-    );
-    let err = load_config(f.path()).unwrap_err();
+fn error_dockerfile_and_base_image_conflict() {
+    let tmp = TempDir::new().unwrap();
+    let df = tmp.path().join("Dockerfile");
+    std::fs::write(&df, "FROM alpine\n").unwrap();
+    let toml = "dockerfile = \"Dockerfile\"\nbase_image = \"alpine\"\nnamespace_repository = \"org/repo\"\n";
+    let mut cfg = NamedTempFile::new_in(tmp.path()).unwrap();
+    cfg.write_all(format!("[image]\n{toml}").as_bytes())
+        .unwrap();
+    let err = load_config(cfg.path()).unwrap_err();
     assert_eq!(err.code, "CONFIG_INVALID");
+    assert!(err.message.contains("mutually exclusive"));
 }
 
 #[test]
-fn error_image_missing_script_file() {
-    let f = write_config(
-        "[image]\nbase_image = \"alpine\"\nsetup_script_path = \"/nonexistent/setup.sh\"\n",
-    );
+fn error_dockerfile_and_base_snapshot_conflict() {
+    let tmp = TempDir::new().unwrap();
+    let df = tmp.path().join("Dockerfile");
+    std::fs::write(&df, "FROM alpine\n").unwrap();
+    let toml = "dockerfile = \"Dockerfile\"\nbase_snapshot = \"my-snap\"\nnamespace_repository = \"org/repo\"\n";
+    let mut cfg = NamedTempFile::new_in(tmp.path()).unwrap();
+    cfg.write_all(format!("[image]\n{toml}").as_bytes())
+        .unwrap();
+    let err = load_config(cfg.path()).unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+    assert!(err.message.contains("mutually exclusive"));
+}
+
+#[test]
+fn dockerfile_without_namespace_repository_loads_ok() {
+    // namespace_repository is NOT required at parse time: the user config can supply it.
+    // The error is deferred to dockerfile_image_tag() at tag-compute time.
+    let tmp = TempDir::new().unwrap();
+    let df = tmp.path().join("Dockerfile");
+    std::fs::write(&df, "FROM alpine\n").unwrap();
+    let mut cfg = NamedTempFile::new_in(tmp.path()).unwrap();
+    cfg.write_all(b"[image]\ndockerfile = \"Dockerfile\"\n")
+        .unwrap();
+    let (img, _) = load_config(cfg.path()).unwrap();
+    assert!(img.namespace_repository.is_none());
+}
+
+#[test]
+fn error_dockerfile_path_not_found() {
+    let f = write_config("[image]\ndockerfile = \"./nonexistent.Dockerfile\"\n");
     let err = load_config(f.path()).unwrap_err();
     assert_eq!(err.code, "CONFIG_INVALID");
+    assert!(err.message.contains("does not exist"), "{}", err.message);
 }
 
 #[test]
@@ -483,112 +491,214 @@ fn merge_network_rules_concatenated_user_first() {
     );
 }
 
-// ── snapshot_name tests ───────────────────────────────────────────────────
+// ── merge_registry_configs tests ──────────────────────────────────────────
 
 #[test]
-fn snapshot_name_deterministic() {
-    let a = snapshot_name("alpine:latest", "#!/bin/sh\napk add git\n", &[]);
-    let b = snapshot_name("alpine:latest", "#!/bin/sh\napk add git\n", &[]);
-    assert_eq!(a, b);
+fn merge_registry_project_wins() {
+    let user = RegistryConfig {
+        host: Some("user.registry.io".to_string()),
+        insecure: Some(false),
+    };
+    let project = RegistryConfig {
+        host: Some("project.registry.io".to_string()),
+        insecure: None,
+    };
+    let merged = merge_registry_configs(user, project);
+    assert_eq!(merged.host.as_deref(), Some("project.registry.io"));
+    // insecure: only user has it → user wins
+    assert_eq!(merged.insecure, Some(false));
 }
 
 #[test]
-fn snapshot_name_changes_with_script() {
-    let a = snapshot_name("alpine:latest", "#!/bin/sh\napk add git\n", &[]);
-    let b = snapshot_name("alpine:latest", "#!/bin/sh\napk add curl\n", &[]);
-    assert_ne!(a, b);
+fn merge_registry_user_fills_absent_project_fields() {
+    let user = RegistryConfig {
+        host: Some("user.registry.io".to_string()),
+        insecure: Some(true),
+    };
+    let project = RegistryConfig::default();
+    let merged = merge_registry_configs(user, project);
+    assert_eq!(merged.host.as_deref(), Some("user.registry.io"));
+    assert_eq!(merged.insecure, Some(true));
 }
 
-#[test]
-fn snapshot_name_sanitizes_image() {
-    let name = snapshot_name("alpine:latest", "#!/bin/sh\n", &[]);
-    assert!(name.starts_with("alpine-latest_"));
-}
+// ── load_user_image_config / merge_user_image_config tests ───────────────
 
 #[test]
-fn snapshot_name_sanitizes_slash_and_at() {
-    let name = snapshot_name("ghcr.io/foo/bar:v1", "#!/bin/sh\n", &[]);
-    assert!(name.starts_with("ghcr.io-foo-bar-v1_"));
-}
-
-#[test]
-fn snapshot_name_hash_length() {
-    let name = snapshot_name("alpine:latest", "#!/bin/sh\n", &[]);
-    // format is "<sanitized>_<12chars>"
-    let hash_part = name.rsplit_once('_').unwrap().1;
-    assert_eq!(hash_part.len(), 12);
-}
-
-#[test]
-fn snapshot_name_changes_with_setup_file_content() {
-    let files_a = vec![SetupFile {
-        name: "rust-toolchain.toml".to_string(),
-        content: b"[toolchain]\nchannel = \"1.85\"".to_vec(),
-    }];
-    let files_b = vec![SetupFile {
-        name: "rust-toolchain.toml".to_string(),
-        content: b"[toolchain]\nchannel = \"1.86\"".to_vec(),
-    }];
-    let a = snapshot_name("alpine:latest", "#!/bin/sh\n", &files_a);
-    let b = snapshot_name("alpine:latest", "#!/bin/sh\n", &files_b);
-    assert_ne!(a, b);
-}
-
-#[test]
-fn snapshot_name_stable_with_same_setup_files() {
-    let files = vec![
-        SetupFile {
-            name: "Cargo.lock".to_string(),
-            content: b"[lock-file]".to_vec(),
-        },
-        SetupFile {
-            name: "rust-toolchain.toml".to_string(),
-            content: b"[toolchain]".to_vec(),
-        },
-    ];
-    let a = snapshot_name("alpine:latest", "#!/bin/sh\n", &files);
-    let b = snapshot_name("alpine:latest", "#!/bin/sh\n", &files);
-    assert_eq!(a, b);
-}
-
-#[test]
-fn setup_files_parsed_and_resolved() {
-    use std::io::Write as _;
-    let tmp = TempDir::new().unwrap();
-    let asset = tmp.path().join("rust-toolchain.toml");
-    std::fs::write(&asset, "[toolchain]\nchannel = \"stable\"").unwrap();
-    let config_content = "[image]\nbase_image = \"alpine\"\nsetup_script = \"#!/bin/sh\\n\"\nsetup_files = [\"rust-toolchain.toml\"]\n".to_string();
-    let mut cfg = NamedTempFile::new_in(tmp.path()).unwrap();
-    cfg.write_all(config_content.as_bytes()).unwrap();
-    let (img, _) = load_config(cfg.path()).unwrap();
-    assert_eq!(img.setup_files.len(), 1);
-    assert_eq!(img.setup_files[0].name, "rust-toolchain.toml");
-    assert!(img.setup_files[0].content.starts_with(b"[toolchain]"));
-}
-
-#[test]
-fn setup_files_missing_file_returns_config_invalid() {
+fn load_user_image_config_parses_fields() {
     let f = write_config(
-        "[image]\nbase_image = \"alpine\"\nsetup_script = \"#!/bin/sh\\n\"\nsetup_files = [\"nonexistent.toml\"]\n",
+        r#"
+[image]
+namespace_repository = "myorg/myrepo"
+version = "3"
+"#,
     );
-    let err = load_config(f.path()).unwrap_err();
-    assert_eq!(err.code, "CONFIG_INVALID");
+    let cfg = load_user_image_config_from_path(f.path()).unwrap();
+    assert_eq!(cfg.namespace_repository.as_deref(), Some("myorg/myrepo"));
+    assert_eq!(cfg.version.as_deref(), Some("3"));
 }
 
 #[test]
-fn setup_files_reserved_name_returns_config_invalid() {
+fn load_user_image_config_missing_file_returns_default() {
     let tmp = TempDir::new().unwrap();
-    std::fs::write(tmp.path().join(SETUP_SCRIPT_NAME), "x").unwrap();
-    let mut cfg = NamedTempFile::new_in(tmp.path()).unwrap();
-    cfg.write_all(
-        format!(
-            "[image]\nbase_image = \"alpine\"\nsetup_script = \"#!/bin/sh\\n\"\nsetup_files = [\"{SETUP_SCRIPT_NAME}\"]\n"
-        )
-        .as_bytes(),
-    )
-    .unwrap();
-    let err = load_config(cfg.path()).unwrap_err();
+    let path = tmp.path().join("sodagun.toml");
+    let cfg = load_user_image_config_from_path(&path).unwrap();
+    assert!(cfg.namespace_repository.is_none());
+    assert!(cfg.version.is_none());
+}
+
+#[test]
+fn merge_user_image_config_project_wins_on_conflict() {
+    let user = UserImageConfig {
+        namespace_repository: Some("user/repo".to_string()),
+        version: Some("5".to_string()),
+    };
+    let project = ImageConfig {
+        base_image: None,
+        base_snapshot: None,
+        dockerfile: None,
+        namespace_repository: Some("proj/repo".to_string()),
+        version: Some("2".to_string()),
+    };
+    let merged = merge_user_image_config(user, project);
+    assert_eq!(merged.namespace_repository.as_deref(), Some("proj/repo"));
+    assert_eq!(merged.version.as_deref(), Some("2"));
+}
+
+#[test]
+fn merge_user_image_config_user_fills_absent_project_fields() {
+    let user = UserImageConfig {
+        namespace_repository: Some("user/repo".to_string()),
+        version: Some("5".to_string()),
+    };
+    let project = ImageConfig {
+        base_image: None,
+        base_snapshot: None,
+        dockerfile: None,
+        namespace_repository: None,
+        version: None,
+    };
+    let merged = merge_user_image_config(user, project);
+    assert_eq!(merged.namespace_repository.as_deref(), Some("user/repo"));
+    assert_eq!(merged.version.as_deref(), Some("5"));
+}
+
+// ── dockerfile_image_tag tests ────────────────────────────────────────────
+
+#[test]
+fn dockerfile_image_tag_deterministic() {
+    let img = ImageConfig {
+        base_image: None,
+        base_snapshot: None,
+        dockerfile: None,
+        namespace_repository: Some("org/repo".to_string()),
+        version: None,
+    };
+    let reg = RegistryConfig {
+        host: Some("registry.example.com".to_string()),
+        insecure: None,
+    };
+    let dockerfile = b"FROM alpine\nRUN apk add git\n";
+    let a = dockerfile_image_tag(&img, &reg, dockerfile).unwrap();
+    let b = dockerfile_image_tag(&img, &reg, dockerfile).unwrap();
+    assert_eq!(a, b);
+}
+
+#[test]
+fn dockerfile_image_tag_changes_with_content() {
+    let img = ImageConfig {
+        base_image: None,
+        base_snapshot: None,
+        dockerfile: None,
+        namespace_repository: Some("org/repo".to_string()),
+        version: None,
+    };
+    let reg = RegistryConfig {
+        host: Some("registry.example.com".to_string()),
+        insecure: None,
+    };
+    let a = dockerfile_image_tag(&img, &reg, b"FROM alpine\n").unwrap();
+    let b = dockerfile_image_tag(&img, &reg, b"FROM debian\n").unwrap();
+    assert_ne!(a, b);
+}
+
+#[test]
+fn dockerfile_image_tag_changes_with_version() {
+    let img_v1 = ImageConfig {
+        base_image: None,
+        base_snapshot: None,
+        dockerfile: None,
+        namespace_repository: Some("org/repo".to_string()),
+        version: None, // defaults to "1"
+    };
+    let img_v2 = ImageConfig {
+        base_image: None,
+        base_snapshot: None,
+        dockerfile: None,
+        namespace_repository: Some("org/repo".to_string()),
+        version: Some("2".to_string()),
+    };
+    let reg = RegistryConfig {
+        host: Some("registry.example.com".to_string()),
+        insecure: None,
+    };
+    let dockerfile = b"FROM alpine\n";
+    let a = dockerfile_image_tag(&img_v1, &reg, dockerfile).unwrap();
+    let b = dockerfile_image_tag(&img_v2, &reg, dockerfile).unwrap();
+    assert_ne!(a, b);
+}
+
+#[test]
+fn dockerfile_image_tag_correct_format() {
+    let img = ImageConfig {
+        base_image: None,
+        base_snapshot: None,
+        dockerfile: None,
+        namespace_repository: Some("org/repo".to_string()),
+        version: None,
+    };
+    let reg = RegistryConfig {
+        host: Some("registry.example.com".to_string()),
+        insecure: None,
+    };
+    let tag = dockerfile_image_tag(&img, &reg, b"FROM alpine\n").unwrap();
+    // format: <host>/<namespace_repository>:v<12-char-sha>
+    assert!(tag.starts_with("registry.example.com/org/repo:"));
+    let sha = tag.rsplit_once(':').unwrap().1;
+    assert_eq!(sha.len(), 13);
+    assert!(sha.starts_with('v'));
+}
+
+#[test]
+fn dockerfile_image_tag_missing_host_error() {
+    let img = ImageConfig {
+        base_image: None,
+        base_snapshot: None,
+        dockerfile: None,
+        namespace_repository: Some("org/repo".to_string()),
+        version: None,
+    };
+    let reg = RegistryConfig::default(); // no host
+    let err = dockerfile_image_tag(&img, &reg, b"FROM alpine\n").unwrap_err();
     assert_eq!(err.code, "CONFIG_INVALID");
+    assert!(err.message.contains("registry.host"));
+}
+
+#[test]
+fn dockerfile_image_tag_missing_namespace_error() {
+    let img = ImageConfig {
+        base_image: None,
+        base_snapshot: None,
+        dockerfile: None,
+        namespace_repository: None, // missing
+        version: None,
+    };
+    let reg = RegistryConfig {
+        host: Some("registry.example.com".to_string()),
+        insecure: None,
+    };
+    let err = dockerfile_image_tag(&img, &reg, b"FROM alpine\n").unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+    assert!(err.message.contains("namespace_repository"));
 }
 
 // ── parse_volume tests ────────────────────────────────────────────────────
