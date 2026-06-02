@@ -9,6 +9,14 @@ fn sodagun() -> Command {
     Command::cargo_bin("sodagun").unwrap()
 }
 
+/// Like `sodagun()` but with `XDG_CONFIG_HOME` pointing to an empty temp dir,
+/// isolating the test from the real `~/.config/sodagun/` user config.
+fn sodagun_isolated(xdg_tmp: &TempDir) -> Command {
+    let mut cmd = Command::cargo_bin("sodagun").unwrap();
+    cmd.env("XDG_CONFIG_HOME", xdg_tmp.path());
+    cmd
+}
+
 /// Create a minimal workspace (rootdir + sodagun.json + worktree subdir) without
 /// needing a real git repo. Sufficient for config-error path tests.
 fn make_workspace(rootdir: &Path, branch: &str) {
@@ -244,12 +252,102 @@ fn config_resolution_repo_fallback() {
         .stderr(predicate::str::contains("CONFIG_INVALID"));
 }
 
-// --- Full start test (requires KVM / Apple Silicon hardware virtualization) ---
+// --- CONFIG_INVALID: value_from_cmd exits non-zero ---
+
+/// A secret with `value_from_cmd = "exit 1"` should produce CONFIG_INVALID at launch,
+/// not at parse time.
+#[test]
+fn config_invalid_value_from_cmd_nonzero_exit() {
+    let tmp = TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    make_workspace(&rootdir, "feature");
+    fs::write(
+        rootdir.join("feature").join("sodagun.toml"),
+        r#"
+[image]
+base_image = "alpine"
+
+[sandbox.secrets.MY_SECRET]
+value_from_cmd = "exit 1"
+allowed_hosts = []
+"#,
+    )
+    .unwrap();
+
+    sodagun()
+        .args(["sandbox", "start", rootdir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("CONFIG_INVALID"));
+}
+
+// --- CONFIG_INVALID: unknown network policy name, no policies file ---
+
+#[test]
+fn config_invalid_unknown_policy_no_policies_file() {
+    let tmp = TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    // Set XDG_CONFIG_HOME to an empty dir so no network-policies.toml exists.
+    let xdg_home = tmp.path().join("xdg");
+    fs::create_dir_all(&xdg_home).unwrap();
+    make_workspace(&rootdir, "feature");
+    fs::write(
+        rootdir.join("feature").join("sodagun.toml"),
+        "[image]\nbase_image = \"alpine\"\n[sandbox.network]\npolicy = \"my-nonexistent-policy\"\n",
+    )
+    .unwrap();
+
+    sodagun()
+        .env("XDG_CONFIG_HOME", xdg_home.to_str().unwrap())
+        .args(["sandbox", "start", rootdir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("CONFIG_INVALID"));
+}
+
+// --- CONFIG_INVALID: built-in policy name rejected when policies file exists ---
+
+/// When `network-policies.toml` exists, built-in names like `none` are not available —
+/// only names defined in the file are. Using `policy = "none"` with an existing but
+/// non-matching policies file should produce CONFIG_INVALID.
+#[test]
+fn config_invalid_builtin_name_rejected_when_policies_file_exists() {
+    let tmp = TempDir::new().unwrap();
+    let rootdir = tmp.path().join("workspace");
+    let xdg_home = tmp.path().join("xdg");
+    let policies_dir = xdg_home.join("sodagun");
+    fs::create_dir_all(&policies_dir).unwrap();
+    // Create a policies file that does NOT define "none".
+    fs::write(
+        policies_dir.join("network-policies.toml"),
+        "[my-custom-policy]\ndefault_egress = \"deny\"\ndefault_ingress = \"allow\"\n",
+    )
+    .unwrap();
+    make_workspace(&rootdir, "feature");
+    fs::write(
+        rootdir.join("feature").join("sodagun.toml"),
+        "[image]\nbase_image = \"alpine\"\n[sandbox.network]\npolicy = \"none\"\n",
+    )
+    .unwrap();
+
+    sodagun()
+        .env("XDG_CONFIG_HOME", xdg_home.to_str().unwrap())
+        .args(["sandbox", "start", rootdir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("CONFIG_INVALID"));
+}
+
+// --- Full start tests (require KVM / Apple Silicon hardware virtualization) ---
 
 #[test]
 fn start_creates_sandbox() {
     // Use tmp.path() directly so the sandbox name is the unique tmpXXX dirname.
     let tmp = TempDir::new().unwrap();
+    let xdg_tmp = TempDir::new().unwrap();
     let rootdir = tmp.path();
     make_workspace(rootdir, "feature");
     fs::write(
@@ -258,7 +356,7 @@ fn start_creates_sandbox() {
     )
     .unwrap();
 
-    let output = sodagun()
+    let output = sodagun_isolated(&xdg_tmp)
         .args([
             "--output",
             "json",
@@ -281,7 +379,7 @@ fn start_creates_sandbox() {
     let meta: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(meta["sandbox_name"], data["sandbox_name"]);
 
-    sodagun()
+    sodagun_isolated(&xdg_tmp)
         .args(["sandbox", "remove", rootdir.to_str().unwrap()])
         .assert()
         .success();

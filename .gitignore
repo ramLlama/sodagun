@@ -6,3 +6,7 @@
 
 # OS
 .DS_Store
+
+# claude extras
+.claude/progress.md
+.claude/agent-memory
