@@ -1,5 +1,6 @@
 [image]
 base_image        = "rust:1.95-slim-bookworm"
+oci_upper_size_mib = 6144
 env               = { HOME = "/root" }
 setup_files = ["rust-toolchain.toml", "Cargo.toml", "Cargo.lock"]
 setup_script = """
