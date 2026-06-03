@@ -71,6 +71,30 @@ fn apply_rule_domain_egress_builds_ok() {
     assert_eq!(policy.rules[0].protocols, vec![Protocol::Tcp]);
 }
 
+/// `*.example.com` wildcard destination maps to a `domain_suffix` rule (not a literal domain).
+#[test]
+fn apply_rule_wildcard_domain_uses_suffix() {
+    let rule = NetworkRule {
+        direction: ConfigDirection::Egress,
+        action: ConfigAction::Allow,
+        destination: "*.example.com".to_string(),
+        protocol: Some(ConfigProtocol::Tcp),
+        ports: vec![443],
+    };
+    let policy = apply_rule(NetworkPolicy::builder(), &rule)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(policy.rules.len(), 1);
+    assert_eq!(policy.rules[0].action, Action::Allow);
+    // The destination should be a suffix match on "example.com", not the literal "*.example.com".
+    let dest = format!("{:?}", policy.rules[0].destination);
+    assert!(
+        dest.contains("example.com") && !dest.contains("*.example.com"),
+        "expected suffix destination, got: {dest}"
+    );
+}
+
 /// `apply_rule` with a CIDR deny rule builds correctly.
 #[test]
 fn apply_rule_cidr_deny_builds_ok() {

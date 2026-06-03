@@ -168,6 +168,9 @@ pub struct ImageConfig {
     pub setup_files: Vec<SetupFile>,
     /// Environment variables passed to the ephemeral sandbox during snapshot creation.
     pub env: HashMap<String, String>,
+    /// Writable overlay size for the ephemeral OCI sandbox used during snapshot creation;
+    /// `None` uses the SDK default (4096 MiB).
+    pub oci_upper_size_mib: Option<u32>,
 }
 
 impl ImageConfig {
@@ -225,6 +228,7 @@ pub fn default_image_config() -> ImageConfig {
         setup_script: None,
         setup_files: Vec::new(),
         env: HashMap::new(),
+        oci_upper_size_mib: None,
     }
 }
 
@@ -241,6 +245,7 @@ struct RawImageConfig {
     setup_files: Option<Vec<String>>,
     #[serde(default)]
     env: HashMap<String, String>,
+    oci_upper_size_mib: Option<u32>,
 }
 
 /// Top-level wrapper matching the TOML file structure.
@@ -618,6 +623,7 @@ fn validate_image_config(
         setup_script,
         setup_files,
         env: raw.env,
+        oci_upper_size_mib: raw.oci_upper_size_mib,
     })
 }
 

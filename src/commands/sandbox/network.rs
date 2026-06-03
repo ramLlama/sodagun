@@ -126,6 +126,9 @@ pub(super) fn commit_dest<'a>(
                     rb.allow().cidr(destination)
                 } else if destination.parse::<std::net::IpAddr>().is_ok() {
                     rb.allow().ip(destination)
+                } else if let Some(suffix) = destination.strip_prefix("*.") {
+                    // *.example.com → domain_suffix matches apex + all subdomains
+                    rb.allow().domain_suffix(suffix)
                 } else {
                     rb.allow().domain(destination)
                 }
@@ -137,6 +140,8 @@ pub(super) fn commit_dest<'a>(
                     rb.deny().cidr(destination)
                 } else if destination.parse::<std::net::IpAddr>().is_ok() {
                     rb.deny().ip(destination)
+                } else if let Some(suffix) = destination.strip_prefix("*.") {
+                    rb.deny().domain_suffix(suffix)
                 } else {
                     rb.deny().domain(destination)
                 }

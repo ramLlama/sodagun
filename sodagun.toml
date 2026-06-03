@@ -1,56 +1,66 @@
 [image]
-base_image = "alpine:3.23"
-env         = { HOME = "/root" }
+base_image        = "rust:1.95-slim-bookworm"
+oci_upper_size_mib = 6144
+env               = { HOME = "/root" }
 setup_files = ["rust-toolchain.toml", "Cargo.toml", "Cargo.lock"]
 setup_script = """
-#!/bin/sh
+#! /usr/bin/env bash
+
 set -euxo pipefail
+
+export PATH="/usr/local/cargo/bin:$PATH"
 
 #
 # system setup
 #
 
-SODAGUN_SETUP_PATH="/etc/profile.d/sodagun-setup.sh"
-cat > "$SODAGUN_SETUP_PATH" << 'EOF'
-ulimit -n 65536
-export CARGO_TARGET_DIR=/tmp/target
-EOF
-. "$SODAGUN_SETUP_PATH"
-
-apk add --no-cache \
-  build-base cmake pkgconf \
-  git curl ca-certificates make bash \
-  openssl-dev openssl-libs-static
+mkdir -p /scratch
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+  cmake pkg-config \
+  curl ca-certificates make \
+  libssl-dev libcap-ng-dev
 
 #
 # rust setup
 #
 
-# Install rustup with no default toolchain — toolchain version comes from rust-toolchain.toml
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-  sh -s -- -y --default-toolchain none --no-modify-path
-export PATH="/root/.cargo/bin:$PATH"
-rustup set auto-self-update disable
-
-# Single working dir: rustup reads rust-toolchain.toml; cargo fetch + install run here too
 mkdir -p /tmp/rust-setup
 cp /setup-assets/rust-toolchain.toml /tmp/rust-setup/
 cp /setup-assets/Cargo.toml /tmp/rust-setup/
 cp /setup-assets/Cargo.lock /tmp/rust-setup/
 cd /tmp/rust-setup
-rustup toolchain install          # reads rust-toolchain.toml; installs pinned toolchain + components
 cargo fetch --locked              # downloads all deps into /root/.cargo/registry
-cargo install cargo-deny cargo-audit   # installs to ~/.cargo/bin; CWD is irrelevant for installs
+curl -L --proto '=https' --tlsv1.2 -sSf \
+  https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+cargo binstall --no-confirm cargo-deny cargo-audit
 cd /
-
-# setup envvars for rust
-echo '. /root/.cargo/env' >> /root/.profile
 
 #
 # claude code setup
 #
 
 curl -fsSL https://claude.ai/install.sh | bash
+
+#
+# cleanup
+#
+
+rm -rf \
+  /var/lib/apt/lists/* \
+  /tmp/rust-setup \
+  /usr/local/cargo/registry/src \
+  /usr/local/cargo/bin/cargo-binstall
+
+#
+# login shell environment
+#
+
+cat >> /root/.profile << 'EOF'
+export PATH="/usr/local/cargo/bin:$HOME/.local/bin:$PATH"
+ulimit -n 65536
+export CARGO_TARGET_DIR=/scratch/target
+EOF
 """
 
 [sandbox]
@@ -59,7 +69,7 @@ memory_mb   = 3072
 cpus        = 3
 
 [sandbox.network]
-policy = "claude-only"
+policy = "claude-dev"
 
 [sandbox.env]
 TERM             = "xterm-256color"
