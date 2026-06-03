@@ -297,29 +297,33 @@ value_from_cmd = "echo secret"
 // ── load_network_policies tests ───────────────────────────────────────────
 
 #[test]
-fn load_network_policies_missing_file_returns_empty() {
+fn load_network_policies_missing_dir_returns_empty() {
     let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("network-policies.toml");
-    let (map, exists) = load_network_policies_from_path(&path).unwrap();
+    let dir = tmp.path().join("network-policy.d");
+    let (map, exists) = load_network_policies_from_dir(&dir).unwrap();
     assert!(!exists);
     assert!(map.is_empty());
 }
 
 #[test]
-fn load_network_policies_valid_toml() {
-    let f = write_config(
+fn load_network_policies_valid_dir() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("network-policy.d");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(
+        dir.join("my-policy.toml"),
         r#"
-[my-policy]
 default_egress = "deny"
 default_ingress = "allow"
 
-[[my-policy.rules]]
+[[rules]]
 direction = "egress"
 action = "allow"
 destination = "api.example.com"
 "#,
-    );
-    let (map, exists) = load_network_policies_from_path(f.path()).unwrap();
+    )
+    .unwrap();
+    let (map, exists) = load_network_policies_from_dir(&dir).unwrap();
     assert!(exists);
     let policy = map.get("my-policy").unwrap();
     assert_eq!(policy.default_egress, Some(ConfigAction::Deny));
@@ -329,18 +333,41 @@ destination = "api.example.com"
 }
 
 #[test]
+fn load_network_policies_non_toml_files_ignored() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("network-policy.d");
+    std::fs::create_dir(&dir).unwrap();
+    // A README alongside the policy files must not cause an error.
+    std::fs::write(dir.join("README.md"), "# policies").unwrap();
+    std::fs::write(dir.join("my-policy.toml"), "default_egress = \"deny\"\n").unwrap();
+    let (map, exists) = load_network_policies_from_dir(&dir).unwrap();
+    assert!(exists);
+    assert_eq!(map.len(), 1);
+    assert!(map.contains_key("my-policy"));
+}
+
+#[test]
 fn load_network_policies_malformed_toml() {
-    let f = write_config("not valid toml @@@@");
-    let err = load_network_policies_from_path(f.path()).unwrap_err();
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("network-policy.d");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("bad.toml"), "not valid toml @@@@").unwrap();
+    let err = load_network_policies_from_dir(&dir).unwrap_err();
     assert_eq!(err.code, "CONFIG_INVALID");
 }
 
 #[test]
 fn load_network_policies_reserved_name_rejected() {
     for reserved in RESERVED_POLICY_NAMES {
-        let toml = format!("[{reserved}]\ndefault_egress = \"deny\"\n");
-        let f = write_config(&toml);
-        let err = load_network_policies_from_path(f.path()).unwrap_err();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("network-policy.d");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{reserved}.toml")),
+            "default_egress = \"deny\"\n",
+        )
+        .unwrap();
+        let err = load_network_policies_from_dir(&dir).unwrap_err();
         assert_eq!(
             err.code, "CONFIG_INVALID",
             "expected error for '{reserved}'"

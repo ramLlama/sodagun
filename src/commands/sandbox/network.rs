@@ -19,7 +19,7 @@ pub(super) fn apply_named_policy(
     policies: &HashMap<String, NamedPolicy>,
     policies_path: Option<&std::path::Path>,
 ) -> Result<NetworkPolicyBuilder, SodagunError> {
-    // Built-ins are always resolved first; `network-policies.toml` cannot shadow them.
+    // Built-ins are always resolved first; files in `network-policy.d/` cannot shadow them.
     match name {
         "none" => return Ok(builder.default_deny()),
         "allow-all" => return Ok(builder.default_allow()),
@@ -35,9 +35,14 @@ pub(super) fn apply_named_policy(
     }
     let named = policies.get(name).ok_or_else(|| {
         let hint = match policies_path {
-            Some(path) => format!("define it in {}", path.display()),
-            None => "no network-policies.toml found; built-ins are: none, allow-all, public-only"
-                .to_string(),
+            Some(dir) => format!(
+                "create {}/{name}.toml with the policy definition",
+                dir.display()
+            ),
+            None => {
+                "no network-policy.d/ directory found; built-ins are: none, allow-all, public-only"
+                    .to_string()
+            }
         };
         SodagunError {
             code: "CONFIG_INVALID",
