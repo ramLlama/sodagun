@@ -1,9 +1,10 @@
 [image]
-base_image        = "rust:1.95-alpine3.23"
+base_image        = "rust:1.95-slim-bookworm"
 env               = { HOME = "/root" }
 setup_files = ["rust-toolchain.toml", "Cargo.toml", "Cargo.lock"]
 setup_script = """
-#!/bin/sh
+#! /usr/bin/env bash
+
 set -euxo pipefail
 
 export PATH="/usr/local/cargo/bin:$PATH"
@@ -13,10 +14,11 @@ export PATH="/usr/local/cargo/bin:$PATH"
 #
 
 mkdir -p /scratch
-apk add --no-cache \
-  cmake pkgconf \
-  curl ca-certificates make bash \
-  openssl-dev openssl-libs-static
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+  cmake pkg-config \
+  curl ca-certificates make \
+  libssl-dev libcap-ng-dev
 
 #
 # rust setup
@@ -44,7 +46,7 @@ curl -fsSL https://claude.ai/install.sh | bash
 #
 
 rm -rf \
-  /var/cache/apk/* \
+  /var/lib/apt/lists/* \
   /tmp/rust-setup \
   /usr/local/cargo/registry/src \
   /usr/local/cargo/bin/cargo-binstall
@@ -66,7 +68,7 @@ memory_mb   = 3072
 cpus        = 3
 
 [sandbox.network]
-policy = "claude-only"
+policy = "claude-dev"
 
 [sandbox.env]
 TERM             = "xterm-256color"
