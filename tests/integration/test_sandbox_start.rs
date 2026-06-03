@@ -277,7 +277,7 @@ allowed_hosts = []
 fn config_invalid_unknown_policy_no_policies_file() {
     let tmp = TempDir::new().unwrap();
     let rootdir = tmp.path().join("workspace");
-    // Set XDG_CONFIG_HOME to an empty dir so no network-policies.toml exists.
+    // Set XDG_CONFIG_HOME to an empty dir so no network-policy.d/ directory exists.
     let xdg_home = tmp.path().join("xdg");
     fs::create_dir_all(&xdg_home).unwrap();
     make_workspace(&rootdir, "feature");
@@ -359,22 +359,18 @@ fn config_invalid_value_from_cmd_trailing_newline_accepted() {
     }
 }
 
-// --- CONFIG_INVALID: reserved policy name redefined in network-policies.toml ---
+// --- CONFIG_INVALID: reserved policy name redefined in network-policy.d/ ---
 
-/// `network-policies.toml` must not redefine reserved built-in names.
+/// A file in `network-policy.d/` whose stem is a reserved built-in name must be rejected.
 #[test]
 fn config_invalid_reserved_policy_name_redefined_in_file() {
     let tmp = TempDir::new().unwrap();
     let rootdir = tmp.path().join("workspace");
     let xdg_home = tmp.path().join("xdg");
-    let policies_dir = xdg_home.join("sodagun");
-    fs::create_dir_all(&policies_dir).unwrap();
-    // Attempt to redefine the built-in "none" policy.
-    fs::write(
-        policies_dir.join("network-policies.toml"),
-        "[none]\ndefault_egress = \"allow\"\n",
-    )
-    .unwrap();
+    let policy_d = xdg_home.join("sodagun").join("network-policy.d");
+    fs::create_dir_all(&policy_d).unwrap();
+    // Attempt to redefine the built-in "none" policy via a per-policy file.
+    fs::write(policy_d.join("none.toml"), "default_egress = \"allow\"\n").unwrap();
     make_workspace(&rootdir, "feature");
     fs::write(
         rootdir.join("feature").join("sodagun.toml"),

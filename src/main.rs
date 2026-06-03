@@ -19,7 +19,7 @@ use error::handle_error;
 #[derive(Parser)]
 #[command(
     name = "sodagun",
-    version = env!("CARGO_PKG_VERSION"),
+    version = env!("SODAGUN_BUILD_VERSION"),
     about = "sodagun CLI",
     subcommand_required = true,
     arg_required_else_help = true

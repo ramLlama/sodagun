@@ -472,7 +472,7 @@ async fn start_async(
     image_config: &ImageConfig,
     sandbox_config: &SandboxConfig,
     network_policies: &HashMap<String, NamedPolicy>,
-    // Some(path) when the user's network-policies.toml file exists; None → use built-ins.
+    // Some(dir) when the user's network-policy.d/ directory exists; None → use built-ins.
     policies_path: Option<&std::path::Path>,
 ) -> Result<String, SodagunError> {
     let mut builder = Sandbox::builder(sandbox_name);

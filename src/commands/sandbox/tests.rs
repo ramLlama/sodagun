@@ -133,7 +133,7 @@ fn apply_named_policy_from_file() {
         NetworkPolicy::builder(),
         "my-policy",
         &policies,
-        Some(std::path::Path::new("/test/network-policies.toml")),
+        Some(std::path::Path::new("/test/network-policy.d")),
     )
     .unwrap()
     .build()
@@ -174,7 +174,7 @@ fn apply_named_policy_unknown_in_file_returns_error() {
         NetworkPolicy::builder(),
         "my-missing-policy",
         &policies,
-        Some(std::path::Path::new("/test/network-policies.toml")),
+        Some(std::path::Path::new("/test/network-policy.d")),
     )
     .unwrap_err();
     assert_eq!(err.code, "CONFIG_INVALID");
@@ -198,7 +198,7 @@ fn apply_named_policy_builtin_works_with_file_present() {
             NetworkPolicy::builder(),
             name,
             &policies,
-            Some(std::path::Path::new("/test/network-policies.toml")),
+            Some(std::path::Path::new("/test/network-policy.d")),
         )
         .unwrap_or_else(|e| panic!("built-in '{name}' failed with file present: {e:?}"));
     }

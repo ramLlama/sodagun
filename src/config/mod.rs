@@ -12,7 +12,7 @@ use crate::util::dashify;
 /// The leading underscore keeps it from colliding with any user `setup_files`.
 pub const SETUP_SCRIPT_NAME: &str = "_setup";
 
-/// Built-in network policy names. Always available; `network-policies.toml` cannot redefine them.
+/// Built-in network policy names. Always available; files in `network-policy.d/` cannot redefine them.
 pub const RESERVED_POLICY_NAMES: &[&str] = &["none", "allow-all", "public-only"];
 
 // ── Network config types ──────────────────────────────────────────────────────
@@ -134,7 +134,7 @@ pub struct SandboxConfig {
     pub secrets: HashMap<String, SecretConfig>,
 }
 
-// ── Named network policy (from ~/.config/sodagun/network-policies.toml) ──────
+// ── Named network policy (from ~/.config/sodagun/network-policy.d/) ──────────
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NamedPolicy {
@@ -333,36 +333,58 @@ pub(crate) fn load_user_sandbox_config_from_path(
     Ok(file.sandbox)
 }
 
-/// Load named network policies from `$XDG_CONFIG_HOME/sodagun/network-policies.toml`.
+/// Load named network policies from `$XDG_CONFIG_HOME/sodagun/network-policy.d/`.
 ///
-/// Returns `(map, None)` if the file does not exist, `(map, Some(path))` if it does.
-/// Returns `CONFIG_INVALID` if the file exists but is malformed.
+/// Each `.toml` file in the directory defines one policy; the policy name is the file stem.
+/// Files are loaded in alphabetical order (for determinism). Returns `(map, None)` if the
+/// directory does not exist, `(map, Some(dir_path))` if it does.
+/// Returns `CONFIG_INVALID` if any file is malformed or uses a reserved policy name.
 pub fn load_network_policies()
 -> Result<(HashMap<String, NamedPolicy>, Option<PathBuf>), SodagunError> {
-    let Some(path) = config_path("network-policies.toml") else {
+    let Some(dir) = config_path("network-policy.d") else {
         return Ok((HashMap::new(), None));
     };
-    let (map, exists) = load_network_policies_from_path(&path)?;
-    Ok((map, exists.then_some(path)))
+    let (map, exists) = load_network_policies_from_dir(&dir)?;
+    Ok((map, exists.then_some(dir)))
 }
 
-pub(crate) fn load_network_policies_from_path(
-    path: &Path,
+pub(crate) fn load_network_policies_from_dir(
+    dir: &Path,
 ) -> Result<(HashMap<String, NamedPolicy>, bool), SodagunError> {
-    if !path.exists() {
+    if !dir.exists() {
         return Ok((HashMap::new(), false));
     }
-    let contents = std::fs::read_to_string(path).map_err(|e| SodagunError {
-        code: "CONFIG_INVALID",
-        message: format!("failed to read network policies file: {e}"),
-    })?;
-    let policies: HashMap<String, NamedPolicy> =
-        toml::from_str(&contents).map_err(|e| SodagunError {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| SodagunError {
             code: "CONFIG_INVALID",
-            message: format!("invalid network policies TOML: {e}"),
+            message: format!("failed to read network-policy.d directory: {e}"),
+        })?
+        .collect::<Result<_, _>>()
+        .map_err(|e| SodagunError {
+            code: "CONFIG_INVALID",
+            message: format!("failed to read network-policy.d entry: {e}"),
         })?;
-    // Reserved names are always built-in; redefining them would shadow the built-ins silently.
-    for name in policies.keys() {
+    // Sort for deterministic load order.
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut policies = HashMap::new();
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!(
+                    "network policy filename has non-UTF-8 stem: {}",
+                    path.display()
+                ),
+            })?
+            .to_string();
+        // Reserved names are always built-in; a file with a reserved stem would shadow them.
         if RESERVED_POLICY_NAMES.contains(&name.as_str()) {
             return Err(SodagunError {
                 code: "CONFIG_INVALID",
@@ -371,6 +393,18 @@ pub(crate) fn load_network_policies_from_path(
                 ),
             });
         }
+        let contents = std::fs::read_to_string(&path).map_err(|e| SodagunError {
+            code: "CONFIG_INVALID",
+            message: format!(
+                "failed to read network policy file '{}': {e}",
+                path.display()
+            ),
+        })?;
+        let policy: NamedPolicy = toml::from_str(&contents).map_err(|e| SodagunError {
+            code: "CONFIG_INVALID",
+            message: format!("invalid TOML in network policy '{}': {e}", path.display()),
+        })?;
+        policies.insert(name, policy);
     }
     Ok((policies, true))
 }
