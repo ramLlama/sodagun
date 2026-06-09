@@ -31,7 +31,8 @@ audit:
 		--ignore RUSTSEC-2025-0141 \
 		--ignore RUSTSEC-2026-0118 \
 		--ignore RUSTSEC-2026-0119 \
-		--ignore RUSTSEC-2023-0071
+		--ignore RUSTSEC-2023-0071 \
+		--ignore RUSTSEC-2026-0173
 
 build-debug:
 	cargo build

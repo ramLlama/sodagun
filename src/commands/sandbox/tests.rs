@@ -4,7 +4,242 @@ use crate::config::{ConfigAction, ConfigDirection, ConfigProtocol, NamedPolicy, 
 use microsandbox::NetworkPolicy;
 use microsandbox_network::policy::{Action, Direction, Protocol};
 
-use super::network::{apply_named_policy, apply_rule};
+use super::build_guest_invocation;
+use super::network::{apply_named_policy, apply_rule, parse_net_rule_value};
+use super::validate_env_kv;
+
+// ── parse_net_rule_value / parse_net_rule_spec tests ─────────────────────────
+
+/// Minimal spec `action@destination` (no proto, no port).
+#[test]
+fn net_rule_spec_minimal_allow() {
+    let rules = parse_net_rule_value("allow@host").unwrap();
+    assert_eq!(rules.len(), 1);
+    let r = &rules[0];
+    assert_eq!(r.action, ConfigAction::Allow);
+    assert_eq!(r.destination, "host");
+    assert_eq!(r.direction, ConfigDirection::Egress);
+    assert!(r.protocol.is_none());
+    assert!(r.ports.is_empty());
+}
+
+/// Deny action is parsed correctly.
+#[test]
+fn net_rule_spec_deny_action() {
+    let rules = parse_net_rule_value("deny@public").unwrap();
+    assert_eq!(rules[0].action, ConfigAction::Deny);
+    assert_eq!(rules[0].destination, "public");
+}
+
+/// Full spec with protocol and port.
+#[test]
+fn net_rule_spec_with_proto_and_port() {
+    let rules = parse_net_rule_value("allow@host:tcp:9999").unwrap();
+    let r = &rules[0];
+    assert_eq!(r.action, ConfigAction::Allow);
+    assert_eq!(r.destination, "host");
+    assert_eq!(r.protocol, Some(ConfigProtocol::Tcp));
+    assert_eq!(r.ports, vec![9999u16]);
+}
+
+/// UDP protocol is parsed correctly.
+#[test]
+fn net_rule_spec_udp_protocol() {
+    let rules = parse_net_rule_value("allow@host:udp:53").unwrap();
+    assert_eq!(rules[0].protocol, Some(ConfigProtocol::Udp));
+    assert_eq!(rules[0].ports, vec![53u16]);
+}
+
+/// Protocol without a port.
+#[test]
+fn net_rule_spec_proto_no_port() {
+    let rules = parse_net_rule_value("allow@api.example.com:tcp").unwrap();
+    let r = &rules[0];
+    assert_eq!(r.protocol, Some(ConfigProtocol::Tcp));
+    assert!(r.ports.is_empty());
+}
+
+/// CIDR destination.
+#[test]
+fn net_rule_spec_cidr_destination() {
+    let rules = parse_net_rule_value("deny@10.0.0.0/8").unwrap();
+    assert_eq!(rules[0].destination, "10.0.0.0/8");
+}
+
+/// Comma-separated specs in one --net-rule value produce multiple rules.
+#[test]
+fn net_rule_value_comma_separated() {
+    let rules = parse_net_rule_value("allow@host:tcp:9999,deny@public").unwrap();
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].destination, "host");
+    assert_eq!(rules[0].ports, vec![9999u16]);
+    assert_eq!(rules[1].destination, "public");
+    assert_eq!(rules[1].action, ConfigAction::Deny);
+}
+
+/// Whitespace around comma-separated specs is trimmed.
+#[test]
+fn net_rule_value_trims_whitespace() {
+    let rules = parse_net_rule_value("allow@host , deny@public").unwrap();
+    assert_eq!(rules.len(), 2);
+}
+
+/// Missing `@` separator → CONFIG_INVALID.
+#[test]
+fn net_rule_spec_missing_at_sign() {
+    let err = parse_net_rule_value("allowhost").unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+    assert!(err.message.contains("allowhost"));
+}
+
+/// Unknown action → CONFIG_INVALID.
+#[test]
+fn net_rule_spec_invalid_action() {
+    let err = parse_net_rule_value("permit@host").unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+    assert!(err.message.contains("permit"));
+}
+
+/// Unknown protocol → CONFIG_INVALID.
+#[test]
+fn net_rule_spec_invalid_protocol() {
+    let err = parse_net_rule_value("allow@host:icmp:9999").unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+    assert!(err.message.contains("icmp"));
+}
+
+/// Non-numeric port → CONFIG_INVALID.
+#[test]
+fn net_rule_spec_invalid_port() {
+    let err = parse_net_rule_value("allow@host:tcp:nope").unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+    assert!(err.message.contains("nope"));
+}
+
+/// Port 0 is a valid u16 and accepted (the firewall rule is unusual but not invalid).
+#[test]
+fn net_rule_spec_port_zero_accepted() {
+    let rules = parse_net_rule_value("allow@host:tcp:0").unwrap();
+    assert_eq!(rules[0].ports, vec![0u16]);
+}
+
+// ── validate_env_kv tests ─────────────────────────────────────────────────────
+
+#[test]
+fn validate_env_kv_simple_key() {
+    assert!(validate_env_kv("FOO=bar").is_ok());
+}
+
+#[test]
+fn validate_env_kv_key_with_spaces() {
+    assert!(validate_env_kv("MY KEY=value").is_ok());
+}
+
+/// A newline in the key would break the `export KEY=VAL` shell construct.
+#[test]
+fn validate_env_kv_newline_in_key_rejected() {
+    let err = validate_env_kv("FOO\nBAR=value").unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+}
+
+/// NUL byte in key is rejected.
+#[test]
+fn validate_env_kv_nul_in_key_rejected() {
+    let err = validate_env_kv("FOO\0BAR=value").unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+}
+
+/// Trailing newline in value is rejected (control character).
+#[test]
+fn validate_env_kv_newline_in_value_rejected() {
+    let err = validate_env_kv("FOOBAR=baz\n").unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+}
+
+/// NUL byte in value is rejected.
+#[test]
+fn validate_env_kv_nul_in_value_rejected() {
+    let err = validate_env_kv("FOOBAR=baz\0qux").unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+}
+
+// ── build_guest_invocation tests ──────────────────────────────────────────────
+
+/// No env, no login → direct invocation, no shell wrapper.
+#[test]
+fn guest_invocation_direct_no_login() {
+    let (prog, args) = build_guest_invocation("htop", &[], &[], false);
+    assert_eq!(prog, "htop");
+    assert!(args.is_empty());
+}
+
+/// No env, no login, with args → direct invocation with args passed through.
+#[test]
+fn guest_invocation_direct_with_args() {
+    let args_in = vec!["--delay".to_string(), "1".to_string()];
+    let (prog, args) = build_guest_invocation("htop", &args_in, &[], false);
+    assert_eq!(prog, "htop");
+    assert_eq!(args, args_in);
+}
+
+/// Login with no env → sh -l -c 'exec "$0" "$@"' cmd.
+#[test]
+fn guest_invocation_login_no_env() {
+    let (prog, args) = build_guest_invocation("cargo", &["test".to_string()], &[], true);
+    assert_eq!(prog, "/bin/sh");
+    assert_eq!(args[0], "-l");
+    assert_eq!(args[1], "-c");
+    assert!(
+        args[2].contains("exec \"$0\" \"$@\""),
+        "script should use exec: {}",
+        args[2]
+    );
+    assert_eq!(args[3], "cargo");
+    assert_eq!(args[4], "test");
+}
+
+/// Env vars are exported in the script.
+#[test]
+fn guest_invocation_env_no_login() {
+    let env = vec!["FOO=bar".to_string(), "BAZ=qux".to_string()];
+    let (prog, args) = build_guest_invocation("env", &[], &env, false);
+    assert_eq!(prog, "/bin/sh");
+    // No -l flag; first arg is -c
+    assert_eq!(args[0], "-c");
+    let script = &args[1];
+    assert!(script.contains("export FOO='bar'"), "script: {script}");
+    assert!(script.contains("export BAZ='qux'"), "script: {script}");
+    assert!(script.contains("exec \"$0\" \"$@\""), "script: {script}");
+    assert_eq!(args[2], "env");
+}
+
+/// Single quotes in env values are escaped correctly.
+#[test]
+fn guest_invocation_env_value_with_single_quote() {
+    let env = vec!["MSG=it's a test".to_string()];
+    let (_, args) = build_guest_invocation("sh", &[], &env, false);
+    let script = &args[1];
+    // "it's a test" → 'it'\''s a test'
+    assert!(
+        script.contains(r"'it'\''s a test'"),
+        "expected escaped single quote in: {script}"
+    );
+}
+
+/// Env + login: -l comes before -c.
+#[test]
+fn guest_invocation_env_with_login() {
+    let env = vec!["KEY=val".to_string()];
+    let (prog, args) = build_guest_invocation("sh", &[], &env, true);
+    assert_eq!(prog, "/bin/sh");
+    assert_eq!(args[0], "-l");
+    assert_eq!(args[1], "-c");
+    let script = &args[2];
+    assert!(script.contains("export KEY='val'"));
+    assert_eq!(args[3], "sh"); // cmd after script
+}
+
+// ── existing network tests ────────────────────────────────────────────────────
 
 /// `public-only` builder output matches `NetworkPolicy::public_only()` exactly —
 /// same defaults, same rule count, and same fields per rule.

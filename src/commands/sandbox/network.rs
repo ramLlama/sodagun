@@ -4,6 +4,92 @@ use crate::config::{ConfigAction, ConfigDirection, ConfigProtocol, NamedPolicy, 
 use crate::error::SodagunError;
 use microsandbox_network::policy::{Action, NetworkPolicyBuilder, RuleBuilder};
 
+/// Parse a comma-separated list of net-rule SPEC strings into `NetworkRule`s.
+///
+/// Each spec has the form `action@destination[:proto[:port]]`, e.g.
+/// `allow@host:tcp:9999`. Direction is always `egress`; use `sodagun.toml` for
+/// ingress or `any`-direction rules.
+///
+/// **Limitation**: IPv6 literal addresses (which contain `:`) are not supported in the
+/// CLI SPEC format because `:` is used to separate destination, proto, and port. Use
+/// `sodagun.toml` `[[sandbox.network.rules]]` entries for IPv6 destinations instead.
+pub(super) fn parse_net_rule_value(value: &str) -> Result<Vec<NetworkRule>, SodagunError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_net_rule_spec)
+        .collect()
+}
+
+/// Parse one SPEC of the form `action@destination[:proto[:port]]`.
+fn parse_net_rule_spec(spec: &str) -> Result<NetworkRule, SodagunError> {
+    let (action_str, rest) = spec.split_once('@').ok_or_else(|| SodagunError {
+        code: "CONFIG_INVALID",
+        message: format!(
+            "invalid --net-rule spec '{spec}': expected 'action@destination[...]', e.g. 'allow@host:tcp:9999'"
+        ),
+    })?;
+
+    let action = match action_str {
+        "allow" => ConfigAction::Allow,
+        "deny" => ConfigAction::Deny,
+        _ => {
+            return Err(SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!(
+                    "invalid action '{action_str}' in --net-rule spec '{spec}': expected 'allow' or 'deny'"
+                ),
+            });
+        }
+    };
+
+    // rest = destination[:proto[:port]]
+    let mut parts = rest.splitn(3, ':');
+    let destination = parts.next().unwrap_or("").to_string();
+    if destination.is_empty() {
+        return Err(SodagunError {
+            code: "CONFIG_INVALID",
+            message: format!("invalid --net-rule spec '{spec}': destination is empty"),
+        });
+    }
+
+    let protocol = match parts.next() {
+        None | Some("") => None,
+        Some("tcp") => Some(ConfigProtocol::Tcp),
+        Some("udp") => Some(ConfigProtocol::Udp),
+        Some(other) => {
+            return Err(SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!(
+                    "invalid protocol '{other}' in --net-rule spec '{spec}': expected 'tcp' or 'udp'"
+                ),
+            });
+        }
+    };
+
+    let ports = match parts.next() {
+        None | Some("") => vec![],
+        Some(port_str) => {
+            let p: u16 = port_str.parse().map_err(|_| SodagunError {
+                code: "CONFIG_INVALID",
+                message: format!(
+                    "invalid port '{port_str}' in --net-rule spec '{spec}': expected a number 0-65535"
+                ),
+            })?;
+            vec![p]
+        }
+    };
+
+    Ok(NetworkRule {
+        direction: ConfigDirection::Egress,
+        action,
+        destination,
+        protocol,
+        ports,
+    })
+}
+
 pub(super) fn to_sdk_action(action: ConfigAction) -> Action {
     match action {
         ConfigAction::Allow => Action::Allow,

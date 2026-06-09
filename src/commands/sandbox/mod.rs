@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config::{
-    ImageConfig, NamedPolicy, RawSandboxConfig, SandboxConfig, load_network_policies,
-    load_user_sandbox_config, merge_sandbox_configs, parse_volume,
+    ConfigAction, ImageConfig, NamedPolicy, NetworkRule, RawSandboxConfig, SandboxConfig,
+    load_network_policies, load_user_sandbox_config, merge_sandbox_configs, parse_volume,
 };
 use crate::context::{Context, OutputFormat};
 use crate::error::{SodagunError, handle_error};
@@ -15,16 +15,93 @@ use microsandbox::{MicrosandboxError, NetworkPolicy, Sandbox, Snapshot};
 
 mod network;
 mod values;
-use self::network::{apply_named_policy, apply_rule, to_sdk_action};
-use self::values::{resolve_env_value, resolve_secret_value};
+use self::network::{apply_named_policy, apply_rule, parse_net_rule_value, to_sdk_action};
+use self::values::{resolve_env_value, resolve_secret_value, validate_value_str};
 
 #[cfg(test)]
 mod tests;
+
+/// CLI-provided network overrides passed from `sandbox start` flags to [`start_async`].
+struct CliNetOptions {
+    rules: Vec<NetworkRule>,
+    default_egress: Option<ConfigAction>,
+    default_ingress: Option<ConfigAction>,
+}
 
 /// Name prefix shared by all sodagun-created sandboxes: worktree sandboxes
 /// (`sodagun_<repo>_<branch>_<uuid>`) and ephemeral snapshot builders
 /// (`sodagun-snap-<uuid>`). Used to filter `sandbox list` to our own VMs.
 const SODAGUN_PREFIX: &str = "sodagun";
+
+/// Build the program and arguments for running `cmd` (with `args`) inside a guest shell.
+///
+/// Wraps in `sh [-l] -c '...'` when `login=true` or `env` is non-empty; otherwise returns
+/// a direct invocation with no shell overhead. The `exec "$0" "$@"` idiom replaces the wrapper
+/// shell in-place, preserving argv without re-quoting. Each entry in `env` must be `KEY=VALUE`;
+/// values are single-quote-escaped for safe embedding in the script.
+pub(super) fn build_guest_invocation(
+    cmd: &str,
+    args: &[String],
+    env: &[String],
+    login: bool,
+) -> (String, Vec<String>) {
+    if env.is_empty() && !login {
+        return (cmd.to_string(), args.to_vec());
+    }
+
+    let mut script = String::new();
+    for kv in env {
+        match kv.find('=') {
+            Some(eq) => {
+                let key = &kv[..eq];
+                let val = &kv[eq + 1..];
+                script.push_str("export ");
+                script.push_str(key);
+                script.push('=');
+                script.push_str(&shell_single_quote(val));
+                script.push_str("; ");
+            }
+            None => {
+                // KEY with no '=' — export as empty string
+                script.push_str("export ");
+                script.push_str(kv);
+                script.push_str("=''; ");
+            }
+        }
+    }
+    script.push_str("exec \"$0\" \"$@\"");
+
+    let mut sh_args = Vec::new();
+    if login {
+        sh_args.push("-l".to_string());
+    }
+    sh_args.push("-c".to_string());
+    sh_args.push(script);
+    sh_args.push(cmd.to_string());
+    sh_args.extend_from_slice(args);
+
+    ("/bin/sh".to_string(), sh_args)
+}
+
+/// Wrap `s` in POSIX single quotes, escaping embedded single quotes as `'\''`.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::from("'");
+    out.push_str(&s.replace('\'', "'\\''"));
+    out.push('\'');
+    out
+}
+
+/// Validate a `KEY=VALUE` env-var string, rejecting control characters in the key.
+///
+/// Values are single-quote-escaped by [`build_guest_invocation`] and safe to embed;
+/// only the key is interpolated raw into the shell script so it must not contain
+/// control characters (newlines, NUL, etc.) that would break the `export KEY=VAL`
+/// construct.
+pub(super) fn validate_env_kv(kv: &str) -> Result<(), SodagunError> {
+    let (key, val) = kv.split_once('=').unwrap_or((kv, ""));
+    validate_value_str(&format!("--env key '{key}'"), key)?;
+    validate_value_str(&format!("--env value for '{key}'"), val)
+}
 
 #[derive(Parser)]
 pub struct SandboxCommand {
@@ -56,6 +133,22 @@ pub struct StartArgs {
     /// Path to the sodagun config file (default: <worktree-path>/sodagun.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
+
+    /// Extra network rules appended after config rules (repeatable; comma-separated per value).
+    /// Format: `action@destination[:proto[:port]]`, e.g. `allow@host:tcp:9999`.
+    /// Direction is egress; use sodagun.toml for ingress/any rules.
+    #[arg(long = "net-rule", value_name = "SPEC")]
+    pub net_rules: Vec<String>,
+
+    /// Override the default egress action from config.
+    #[arg(long = "net-default-egress", value_name = "ACTION",
+          value_parser = clap::builder::PossibleValuesParser::new(["allow", "deny"]))]
+    pub net_default_egress: Option<String>,
+
+    /// Override the default ingress action from config.
+    #[arg(long = "net-default-ingress", value_name = "ACTION",
+          value_parser = clap::builder::PossibleValuesParser::new(["allow", "deny"]))]
+    pub net_default_ingress: Option<String>,
 }
 
 #[derive(Parser)]
@@ -66,6 +159,15 @@ pub struct AttachArgs {
     /// Skip login shell; attach without sourcing profile files.
     #[arg(long)]
     pub no_login: bool,
+
+    /// Extra environment variables injected into the in-guest command (KEY=VALUE; repeatable).
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+
+    /// Command (and its arguments) to run inside the sandbox via a PTY, replacing the default
+    /// shell. Pass after `--` to prevent clap from treating hyphenated args as flags.
+    #[arg(last = true)]
+    pub cmd: Vec<String>,
 }
 
 #[derive(Parser)]
@@ -83,6 +185,10 @@ pub struct ExecArgs {
     /// Skip login shell; run the command directly without sourcing profile files.
     #[arg(long)]
     pub no_login: bool,
+
+    /// Extra environment variables injected into the in-guest command (KEY=VALUE; repeatable).
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
 }
 
 #[derive(Parser)]
@@ -234,6 +340,26 @@ fn start(ctx: Context, args: StartArgs) {
             )
         });
 
+    // Parse CLI net-rule specs (comma-separated per --net-rule value, egress-only)
+    let cli_rules: Vec<NetworkRule> = args
+        .net_rules
+        .iter()
+        .map(|v| parse_net_rule_value(v))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| handle_error(ctx, e))
+        .into_iter()
+        .flatten()
+        .collect();
+
+    // Parse CLI default actions (already validated by clap to "allow"/"deny")
+    let parse_action = |s: &str| match s {
+        "allow" => ConfigAction::Allow,
+        "deny" => ConfigAction::Deny,
+        _ => unreachable!("clap restricts values to 'allow' and 'deny'"),
+    };
+    let cli_default_egress = args.net_default_egress.as_deref().map(parse_action);
+    let cli_default_ingress = args.net_default_ingress.as_deref().map(parse_action);
+
     // Reserve the sandbox name in metadata BEFORE launching. This way, if the process is
     // interrupted after launch succeeds but before a post-launch write, the name is already
     // persisted and the sandbox is still reachable. If launch fails, we clear it as rollback.
@@ -242,6 +368,12 @@ fn start(ctx: Context, args: StartArgs) {
     {
         handle_error(ctx, e);
     }
+
+    let cli_net = CliNetOptions {
+        rules: cli_rules,
+        default_egress: cli_default_egress,
+        default_ingress: cli_default_ingress,
+    };
 
     let rt = util::get_runtime();
     let name = match rt.block_on(start_async(
@@ -252,6 +384,7 @@ fn start(ctx: Context, args: StartArgs) {
         &sandbox_config,
         &network_policies,
         policies_path.as_deref(),
+        &cli_net,
     )) {
         Ok(n) => n,
         Err(e) => {
@@ -273,16 +406,51 @@ fn start(ctx: Context, args: StartArgs) {
 }
 
 fn attach(ctx: Context, args: AttachArgs) {
+    for kv in &args.env {
+        if !kv.contains('=') {
+            handle_error(
+                ctx,
+                SodagunError {
+                    code: "CONFIG_INVALID",
+                    message: format!("--env value '{kv}' must be in KEY=VALUE format"),
+                },
+            );
+        }
+        if let Err(e) = validate_env_kv(kv) {
+            handle_error(ctx, e);
+        }
+    }
+
     let sandbox_name = read_sandbox_name(ctx, &args.workspace_path);
 
     let rt = util::get_runtime();
-    match rt.block_on(attach_async(&sandbox_name, !args.no_login)) {
+    match rt.block_on(attach_async(
+        &sandbox_name,
+        !args.no_login,
+        &args.env,
+        &args.cmd,
+    )) {
         Ok(exit_code) => std::process::exit(exit_code),
         Err(e) => handle_error(ctx, e),
     }
 }
 
 fn exec(ctx: Context, args: ExecArgs) {
+    for kv in &args.env {
+        if !kv.contains('=') {
+            handle_error(
+                ctx,
+                SodagunError {
+                    code: "CONFIG_INVALID",
+                    message: format!("--env value '{kv}' must be in KEY=VALUE format"),
+                },
+            );
+        }
+        if let Err(e) = validate_env_kv(kv) {
+            handle_error(ctx, e);
+        }
+    }
+
     let sandbox_name = read_sandbox_name(ctx, &args.workspace_path);
 
     let rt = util::get_runtime();
@@ -291,6 +459,7 @@ fn exec(ctx: Context, args: ExecArgs) {
         &args.cmd,
         &args.args,
         !args.no_login,
+        &args.env,
     )) {
         Ok(output) => {
             let exit_code = output.status().code;
@@ -465,6 +634,7 @@ async fn remove_async(name: &str, timeout: Duration) -> Result<(), SodagunError>
         .map_err(|e| util::map_sandbox_err(e, name))
 }
 
+#[allow(clippy::too_many_arguments)] // private helper; all params are semantically distinct
 async fn start_async(
     ctx: Context,
     sandbox_name: &str,
@@ -474,6 +644,7 @@ async fn start_async(
     network_policies: &HashMap<String, NamedPolicy>,
     // Some(dir) when the user's network-policy.d/ directory exists; None → use built-ins.
     policies_path: Option<&std::path::Path>,
+    cli_net: &CliNetOptions,
 ) -> Result<String, SodagunError> {
     let mut builder = Sandbox::builder(sandbox_name);
 
@@ -515,7 +686,10 @@ async fn start_async(
     let has_network_config = net.policy.is_some()
         || !net.rules.is_empty()
         || net.default_egress.is_some()
-        || net.default_ingress.is_some();
+        || net.default_ingress.is_some()
+        || !cli_net.rules.is_empty()
+        || cli_net.default_egress.is_some()
+        || cli_net.default_ingress.is_some();
 
     if !has_network_config {
         builder = builder.disable_network();
@@ -528,16 +702,26 @@ async fn start_async(
                 apply_named_policy(policy_builder, name, network_policies, policies_path)?;
         }
 
-        // Apply inline rules (user + project already merged; user first)
+        // Apply inline rules (user + project already merged; user first), then CLI rules.
+        // CLI rules append after config rules so first-match-wins keeps them effective.
         for rule in &net.rules {
             policy_builder = apply_rule(policy_builder, rule)?;
         }
+        for rule in &cli_net.rules {
+            policy_builder = apply_rule(policy_builder, rule)?;
+        }
 
-        // Inline defaults override named-policy defaults (last-write-wins in the builder)
+        // Apply defaults: config overrides named-policy, CLI overrides config (last write wins).
         if let Some(action) = net.default_egress {
             policy_builder = policy_builder.default_egress(to_sdk_action(action));
         }
         if let Some(action) = net.default_ingress {
+            policy_builder = policy_builder.default_ingress(to_sdk_action(action));
+        }
+        if let Some(action) = cli_net.default_egress {
+            policy_builder = policy_builder.default_egress(to_sdk_action(action));
+        }
+        if let Some(action) = cli_net.default_ingress {
             policy_builder = policy_builder.default_ingress(to_sdk_action(action));
         }
 
@@ -612,6 +796,7 @@ async fn exec_async(
     cmd: &str,
     args: &[String],
     login: bool,
+    env: &[String],
 ) -> Result<microsandbox::sandbox::ExecOutput, SodagunError> {
     let sandbox = Sandbox::start(sandbox_name)
         .await
@@ -620,37 +805,27 @@ async fn exec_async(
             message: format!("failed to connect to sandbox '{sandbox_name}': {e}"),
         })?;
 
-    if login {
-        // Run through a login shell so profile files (and PATH, e.g. /root/.cargo/bin)
-        // are sourced. `sh -l -c 'exec "$0" "$@"' <cmd> <args>` sources the profiles
-        // then `exec` *replaces* the shell in place with the real command — no nested
-        // shell — preserving argv exactly without re-quoting (cmd is $0, args are $@).
-        let login_args: Vec<&str> = ["-l", "-c", "exec \"$0\" \"$@\"", cmd]
-            .iter()
-            .copied()
-            .chain(args.iter().map(String::as_str))
-            .collect();
-        sandbox
-            .exec("/bin/sh", login_args)
-            .await
-            .map_err(|e| SodagunError {
-                code: "SANDBOX_ERROR",
-                message: format!("exec failed in sandbox '{sandbox_name}': {e}"),
-            })
-    } else {
-        sandbox
-            .exec(cmd, args.iter().map(String::as_str))
-            .await
-            .map_err(|e| SodagunError {
-                code: "SANDBOX_ERROR",
-                message: format!("exec failed in sandbox '{sandbox_name}': {e}"),
-            })
-    }
+    // Run through a login shell so profile files (and PATH, e.g. /root/.cargo/bin) are sourced.
+    // When env vars are provided they are injected via the wrapper script. The `exec "$0" "$@"`
+    // idiom replaces the wrapper shell in-place with the real command, preserving argv exactly.
+    let (prog, prog_args) = build_guest_invocation(cmd, args, env, login);
+    sandbox
+        .exec(&prog, prog_args.iter().map(String::as_str))
+        .await
+        .map_err(|e| SodagunError {
+            code: "SANDBOX_ERROR",
+            message: format!("exec failed in sandbox '{sandbox_name}': {e}"),
+        })
 }
 
 /// Returns the shell's exit code on a normal interactive session end.
 /// Returns `Err` only on infrastructure failure (connection lost, etc.).
-async fn attach_async(sandbox_name: &str, login: bool) -> Result<i32, SodagunError> {
+async fn attach_async(
+    sandbox_name: &str,
+    login: bool,
+    env: &[String],
+    cmd: &[String],
+) -> Result<i32, SodagunError> {
     let sandbox = Sandbox::start(sandbox_name)
         .await
         .map_err(|e| SodagunError {
@@ -658,18 +833,38 @@ async fn attach_async(sandbox_name: &str, login: bool) -> Result<i32, SodagunErr
             message: format!("failed to connect to sandbox '{sandbox_name}': {e}"),
         })?;
 
-    if login {
-        sandbox
-            .attach("/bin/sh", ["-l"])
-            .await
-            .map_err(|e| SodagunError {
+    if cmd.is_empty() && env.is_empty() {
+        // Existing behavior: interactive shell with optional login.
+        return if login {
+            sandbox
+                .attach("/bin/sh", ["-l"])
+                .await
+                .map_err(|e| SodagunError {
+                    code: "SANDBOX_ERROR",
+                    message: format!("attach session failed: {e}"),
+                })
+        } else {
+            sandbox.attach_shell().await.map_err(|e| SodagunError {
                 code: "SANDBOX_ERROR",
                 message: format!("attach session failed: {e}"),
             })
+        };
+    }
+
+    // Run a specific command or set env vars before the shell via the wrapper.
+    // When no cmd is given, default to /bin/sh so env-only attach stays interactive.
+    let effective_cmd = if cmd.is_empty() {
+        "/bin/sh"
     } else {
-        sandbox.attach_shell().await.map_err(|e| SodagunError {
+        cmd[0].as_str()
+    };
+    let effective_args: &[String] = if cmd.is_empty() { &[] } else { &cmd[1..] };
+    let (prog, prog_args) = build_guest_invocation(effective_cmd, effective_args, env, login);
+    sandbox
+        .attach(&prog, prog_args.iter().map(String::as_str))
+        .await
+        .map_err(|e| SodagunError {
             code: "SANDBOX_ERROR",
             message: format!("attach session failed: {e}"),
         })
-    }
 }

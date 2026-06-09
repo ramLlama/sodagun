@@ -51,6 +51,11 @@ Reads `sodagun.json` from the workspace, then resolves the project config (expli
 
 Options:
 - `--config <path>` — config file path (overrides the resolution chain)
+- `--net-rule <SPEC>` — repeatable (and comma-separated per value); in-situ egress network rules appended *after* the config/named-policy rules. Format: `action@destination[:proto[:port]]` (e.g. `allow@host:tcp:9999`). `action` is `allow`/`deny`; `proto` is `tcp`/`udp`; direction is always egress. IPv6 literals are unsupported in the CLI (the `:` separator collides with them) — use `sodagun.toml` `[[sandbox.network.rules]]` for those. Since the policy is first-match-wins, appending keeps CLI rules effective.
+- `--net-default-egress allow|deny` — override the default egress action from config (last-write-wins in the builder, so CLI beats config).
+- `--net-default-ingress allow|deny` — override the default ingress action from config.
+
+CLI net rules/defaults also **activate** the network policy even when the config selects no policy (i.e. they bootstrap a policy from nothing).
 
 The sandbox name is reserved in `sodagun.json` *before* launch, then cleared on launch failure (rollback). Erroring if a sandbox is already recorded yields `SANDBOX_ALREADY_STARTED`.
 
@@ -63,6 +68,10 @@ Reads the sandbox name from `sodagun.json`, reconnects to the running sandbox (`
 
 Options:
 - `--no-login` — skip the login shell
+- `--env KEY=VALUE` — repeatable; inject extra environment variables into the in-guest command.
+- `-- CMD [ARGS...]` — anything after `--` runs `CMD` via a PTY instead of the default login shell. Without `--`, behavior is unchanged (interactive shell).
+
+When `--env` is given or an explicit command is specified, the invocation is wrapped via `build_guest_invocation` in `sh [-l] -c 'export K=V; …; exec "$0" "$@"'`; otherwise a plain login/non-login shell is attached.
 
 ### `sandbox exec <workspace-path> <cmd> [args...]`
 
@@ -70,8 +79,9 @@ Reads the sandbox name from `sodagun.json`, connects (`Sandbox::start`), runs `c
 
 Options:
 - `--no-login` — run `cmd` directly instead of through a login shell
+- `--env KEY=VALUE` — repeatable; inject extra environment variables into the in-guest command.
 
-By default the command is run through a login shell so profiles/PATH (e.g. `/root/.cargo/bin`) are sourced: `sh -l -c 'exec "$0" "$@"' <cmd> <args>`. The `exec` *replaces* the shell in place with the real command (no nested shell), preserving argv exactly without re-quoting (`cmd` is `$0`, args are `$@`).
+By default the command is run through a login shell so profiles/PATH (e.g. `/root/.cargo/bin`) are sourced: `sh -l -c 'exec "$0" "$@"' <cmd> <args>`. The `exec` *replaces* the shell in place with the real command (no nested shell), preserving argv exactly without re-quoting (`cmd` is `$0`, args are `$@`). With `--env`, `build_guest_invocation` prepends `export K=V; …` (values POSIX single-quote-escaped) before the `exec`.
 
 Text success: writes captured stdout/stderr to the corresponding streams.
 JSON success: `{"status": "ok", "exit_code": N, "stdout": "...", "stderr": "..."}`
@@ -150,7 +160,7 @@ JSON success: `{"status": "ok", "removed": ["..."]}`
 - `WORKSPACE_INVALID` — `sodagun.json` is malformed, unreadable, or fails to serialize/write
 - `WORKTREE_NOT_FOUND` — the worktree path recorded in `sodagun.json` does not exist or is not a directory
 - `CONFIG_NOT_FOUND` — `sodagun.toml` missing from the config path
-- `CONFIG_INVALID` — malformed TOML (incl. user `sodagun.toml` / files in `network-policy.d/`); missing `base_image`/`base_snapshot` in `[image]`; both set together; `setup_script`+`setup_script_path` conflict; a missing/unreadable `setup_files` entry; a `setup_files` entry with a non-UTF-8 basename or the reserved name `_setup`; env/secret key conflict (after merge); `cpus` out of `u8` range; bad volume format; `$HOME` not set for `~` expansion; unresolvable `value_from_env`; `value_from_cmd` exits non-zero; a resolved env/secret value containing control characters; not exactly one of `value`/`value_from_env`/`value_from_cmd` set; unknown network policy name; a file in `network-policy.d/` whose stem is a reserved built-in name; the old `[sandbox.network].mode` key (rejected via `deny_unknown_fields`); non-UTF-8 paths
+- `CONFIG_INVALID` — malformed TOML (incl. user `sodagun.toml` / files in `network-policy.d/`); missing `base_image`/`base_snapshot` in `[image]`; both set together; `setup_script`+`setup_script_path` conflict; a missing/unreadable `setup_files` entry; a `setup_files` entry with a non-UTF-8 basename or the reserved name `_setup`; env/secret key conflict (after merge); `cpus` out of `u8` range; bad volume format; `$HOME` not set for `~` expansion; unresolvable `value_from_env`; `value_from_cmd` exits non-zero; a resolved env/secret value containing control characters; a `--env KEY=VALUE` whose key or value contains control characters (validated by `validate_env_kv`); a malformed `--net-rule` SPEC (missing `@`, bad action/protocol/port, empty destination); not exactly one of `value`/`value_from_env`/`value_from_cmd` set; unknown network policy name; a file in `network-policy.d/` whose stem is a reserved built-in name; the old `[sandbox.network].mode` key (rejected via `deny_unknown_fields`); non-UTF-8 paths
 - `SANDBOX_NOT_STARTED` — workspace has no sandbox recorded in `sodagun.json` (emitted by `attach`/`exec`/`stop`/`remove` when `sandbox_name` is null)
 - `SANDBOX_ALREADY_STARTED` — `sandbox start` called on a workspace that already has a sandbox recorded
 - `SANDBOX_NOT_FOUND` — named sandbox does not exist (maps `MicrosandboxError::SandboxNotFound`)
@@ -253,7 +263,11 @@ src/
   commands/
     mod.rs
     git.rs            # GitCommand sub-app; add_worktree logic
-    sandbox.rs        # SandboxCommand sub-app; start()/attach()/exec()/list()/stop()/remove() + private async impls, read_sandbox_name(); value resolution (run_value_cmd, validate_value_str, resolve_value_source, resolve_env_value, resolve_secret_value) + network-policy building (apply_named_policy, apply_rule, commit_dest, to_sdk_action)
+    sandbox/
+      mod.rs          # SandboxCommand sub-app; start()/attach()/exec()/list()/stop()/remove() + private async impls, read_sandbox_name(); CliNetOptions (bundles the three --net-* overrides for start_async); build_guest_invocation() (shell-wrapper builder), shell_single_quote(), validate_env_kv()
+      values.rs       # env/secret value resolution (run_value_cmd, validate_value_str, resolve_value_source, resolve_env_value, resolve_secret_value)
+      network.rs      # network-policy building (apply_named_policy, apply_rule, commit_dest, to_sdk_action) + CLI net-rule SPEC parsing (parse_net_rule_value, parse_net_rule_spec)
+      tests.rs        # #[cfg(test)] unit tests for the sandbox module
     snapshot.rs       # SnapshotCommand sub-app; create()/remove()/clean() + async impls, snapshot_build_resources(), SETUP_ASSETS_DIR
 tests/
   integration.rs              # entry point: `mod integration { automod::dir!("tests/integration"); }` auto-discovers every file below as one shared test binary
@@ -277,6 +291,7 @@ Key invariants:
 - `repo.revparse_single()` returns `ErrorCode::NotFound` for unknown refs (equivalent to Python's `KeyError`) — caught separately from other git errors
 - Top-level error handling uses the `handle_error(ctx, SodagunError { code, message }) -> !` pattern rather than `?` / `Result` propagation, so error codes and exit semantics stay explicit
 - `sandbox attach` and `sandbox exec` exit with the inner process's exit code on success (via `std::process::exit()`), not a fixed code
+- `build_guest_invocation(cmd, args, env, login)` centralizes the in-guest shell wrapper for both `attach` and `exec`: it returns a direct `(cmd, args)` invocation when `env` is empty and `login` is false, otherwise wraps in `sh [-l] -c 'export K=V; …; exec "$0" "$@"' cmd args`. Env values are POSIX single-quote-escaped by `shell_single_quote` before embedding; only `--env` keys are interpolated raw, so `validate_env_kv` rejects control chars in the key (and value) up front
 - Async SDK calls are bridged to the synchronous handlers with the shared `util::get_runtime()` runtime; the `*_async` functions own all `.await`s and are private to their command module
 - `util::map_sandbox_err()` maps `SandboxNotFound` → `SANDBOX_NOT_FOUND` (else `SANDBOX_ERROR`); `util::map_snapshot_err()` maps `SnapshotNotFound` → `SNAPSHOT_NOT_FOUND` (else `SNAPSHOT_ERROR`)
 - Stop/wait is delegated to the SDK: `stop`/`remove` call `SandboxHandle::stop_with_timeout(timeout)` to send a graceful shutdown and wait for the sandbox to halt. The `--no-wait` path uses `tokio::spawn` to fire the stop off without awaiting it
@@ -310,7 +325,7 @@ Two release profiles: `release` (fat LTO) and `release-thin` (`inherits = "relea
 - `test_snapshot.rs` — all `[image]` error paths plus an e2e happy-path test that installs git via a setup script and asserts `git version` succeeds in a sandbox booted from the resulting snapshot
 - The happy-path tests above are **not** `#[ignore]`d — they run as part of `cargo test` and pass on a host with hardware virtualization (they will fail without it)
 - `src/config.rs` has `#[cfg(test)]` unit tests covering valid `[image]` configs, defaults, every `CONFIG_INVALID` / `CONFIG_NOT_FOUND` path, `snapshot_name` determinism, `parse_volume` (including tilde expansion + the `$HOME`-unset path, which mutates the env var under a mutex), the rejection of the old `mode` field, `EnvValue`/`value_from_cmd` parsing, `merge_sandbox_configs` semantics, and `load_network_policies` (valid dir, non-toml files ignored, malformed, reserved-name)
-- `src/commands/sandbox.rs` has `#[cfg(test)]` unit tests for `apply_rule` (domain/CIDR) and `apply_named_policy` (from file, unknown built-in, unknown-in-file, built-in works with file present, and `public-only` matching the SDK preset)
+- `src/commands/sandbox/tests.rs` has `#[cfg(test)]` unit tests for `apply_rule` (domain/CIDR) and `apply_named_policy` (from file, unknown built-in, unknown-in-file, built-in works with file present, and `public-only` matching the SDK preset), plus `build_guest_invocation`/`shell_single_quote`/`validate_env_kv` and `parse_net_rule_value`/`parse_net_rule_spec` SPEC parsing
 - `src/util.rs` unit-tests `dashify`; `src/commands/git.rs` unit-tests the rootdir naming contract; `src/workspace.rs` unit-tests the `sodagun.json` roundtrip
 
 ## Dependencies
