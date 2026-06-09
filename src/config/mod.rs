@@ -62,6 +62,16 @@ pub struct NetworkConfig {
     pub rules: Vec<NetworkRule>,
 }
 
+impl NetworkConfig {
+    /// Returns true if any network configuration is present that requires building a policy.
+    pub fn has_config(&self) -> bool {
+        self.policy.is_some()
+            || !self.rules.is_empty()
+            || self.default_egress.is_some()
+            || self.default_ingress.is_some()
+    }
+}
+
 // ── Env / secret value sources ────────────────────────────────────────────────
 
 /// Dynamic value source shared by `[sandbox.env]` and `[sandbox.secrets]`.

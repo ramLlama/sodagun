@@ -6,7 +6,7 @@ use microsandbox_network::policy::{Action, Direction, Protocol};
 
 use super::build_guest_invocation;
 use super::network::{apply_named_policy, apply_rule, parse_net_rule_value};
-use super::validate_env_kv;
+use super::validate_and_extract_env_kv;
 
 // ── parse_net_rule_value / parse_net_rule_spec tests ─────────────────────────
 
@@ -123,52 +123,72 @@ fn net_rule_spec_port_zero_accepted() {
     assert_eq!(rules[0].ports, vec![0u16]);
 }
 
-// ── validate_env_kv tests ─────────────────────────────────────────────────────
+// ── validate_and_extract_env_kv tests ────────────────────────────────────────
 
 #[test]
 fn validate_env_kv_simple_key() {
-    assert!(validate_env_kv("FOO=bar").is_ok());
+    let (k, v) = validate_and_extract_env_kv("FOO=bar").unwrap();
+    assert_eq!(k, "FOO");
+    assert_eq!(v, "bar");
 }
 
 #[test]
 fn validate_env_kv_key_with_spaces() {
-    assert!(validate_env_kv("MY KEY=value").is_ok());
+    assert!(validate_and_extract_env_kv("MY KEY=value").is_ok());
+}
+
+/// Missing `=` separator is now caught inside the function.
+#[test]
+fn validate_env_kv_missing_equals_rejected() {
+    let err = validate_and_extract_env_kv("FOOBAR").unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+    assert!(err.message.contains("KEY=VALUE"));
 }
 
 /// A newline in the key would break the `export KEY=VAL` shell construct.
 #[test]
 fn validate_env_kv_newline_in_key_rejected() {
-    let err = validate_env_kv("FOO\nBAR=value").unwrap_err();
+    let err = validate_and_extract_env_kv("FOO\nBAR=value").unwrap_err();
     assert_eq!(err.code, "CONFIG_INVALID");
 }
 
 /// NUL byte in key is rejected.
 #[test]
 fn validate_env_kv_nul_in_key_rejected() {
-    let err = validate_env_kv("FOO\0BAR=value").unwrap_err();
+    let err = validate_and_extract_env_kv("FOO\0BAR=value").unwrap_err();
     assert_eq!(err.code, "CONFIG_INVALID");
 }
 
 /// Trailing newline in value is rejected (control character).
 #[test]
 fn validate_env_kv_newline_in_value_rejected() {
-    let err = validate_env_kv("FOOBAR=baz\n").unwrap_err();
+    let err = validate_and_extract_env_kv("FOOBAR=baz\n").unwrap_err();
     assert_eq!(err.code, "CONFIG_INVALID");
 }
 
 /// NUL byte in value is rejected.
 #[test]
 fn validate_env_kv_nul_in_value_rejected() {
-    let err = validate_env_kv("FOOBAR=baz\0qux").unwrap_err();
+    let err = validate_and_extract_env_kv("FOOBAR=baz\0qux").unwrap_err();
     assert_eq!(err.code, "CONFIG_INVALID");
 }
 
 // ── build_guest_invocation tests ──────────────────────────────────────────────
 
+fn cmd(s: &str) -> Vec<String> {
+    vec![s.to_string()]
+}
+
+fn cmd_args(s: &str, rest: &[&str]) -> Vec<String> {
+    std::iter::once(s.to_string())
+        .chain(rest.iter().map(|s| s.to_string()))
+        .collect()
+}
+
 /// No env, no login → direct invocation, no shell wrapper.
 #[test]
 fn guest_invocation_direct_no_login() {
-    let (prog, args) = build_guest_invocation("htop", &[], &[], false);
+    let (prog, args) = build_guest_invocation(&cmd("htop"), &HashMap::new(), false);
     assert_eq!(prog, "htop");
     assert!(args.is_empty());
 }
@@ -176,16 +196,25 @@ fn guest_invocation_direct_no_login() {
 /// No env, no login, with args → direct invocation with args passed through.
 #[test]
 fn guest_invocation_direct_with_args() {
-    let args_in = vec!["--delay".to_string(), "1".to_string()];
-    let (prog, args) = build_guest_invocation("htop", &args_in, &[], false);
+    let full_cmd = cmd_args("htop", &["--delay", "1"]);
+    let (prog, args) = build_guest_invocation(&full_cmd, &HashMap::new(), false);
     assert_eq!(prog, "htop");
-    assert_eq!(args, args_in);
+    assert_eq!(args, vec!["--delay".to_string(), "1".to_string()]);
+}
+
+/// Empty cmd, no env, no login → defaults to /bin/sh.
+#[test]
+fn guest_invocation_empty_cmd_defaults_to_sh() {
+    let (prog, args) = build_guest_invocation(&[], &HashMap::new(), false);
+    assert_eq!(prog, "/bin/sh");
+    assert!(args.is_empty());
 }
 
 /// Login with no env → sh -l -c 'exec "$0" "$@"' cmd.
 #[test]
 fn guest_invocation_login_no_env() {
-    let (prog, args) = build_guest_invocation("cargo", &["test".to_string()], &[], true);
+    let full_cmd = cmd_args("cargo", &["test"]);
+    let (prog, args) = build_guest_invocation(&full_cmd, &HashMap::new(), true);
     assert_eq!(prog, "/bin/sh");
     assert_eq!(args[0], "-l");
     assert_eq!(args[1], "-c");
@@ -201,8 +230,11 @@ fn guest_invocation_login_no_env() {
 /// Env vars are exported in the script.
 #[test]
 fn guest_invocation_env_no_login() {
-    let env = vec!["FOO=bar".to_string(), "BAZ=qux".to_string()];
-    let (prog, args) = build_guest_invocation("env", &[], &env, false);
+    let env = HashMap::from([
+        ("FOO".to_string(), "bar".to_string()),
+        ("BAZ".to_string(), "qux".to_string()),
+    ]);
+    let (prog, args) = build_guest_invocation(&cmd("env"), &env, false);
     assert_eq!(prog, "/bin/sh");
     // No -l flag; first arg is -c
     assert_eq!(args[0], "-c");
@@ -216,8 +248,8 @@ fn guest_invocation_env_no_login() {
 /// Single quotes in env values are escaped correctly.
 #[test]
 fn guest_invocation_env_value_with_single_quote() {
-    let env = vec!["MSG=it's a test".to_string()];
-    let (_, args) = build_guest_invocation("sh", &[], &env, false);
+    let env = HashMap::from([("MSG".to_string(), "it's a test".to_string())]);
+    let (_, args) = build_guest_invocation(&cmd("sh"), &env, false);
     let script = &args[1];
     // "it's a test" → 'it'\''s a test'
     assert!(
@@ -229,8 +261,8 @@ fn guest_invocation_env_value_with_single_quote() {
 /// Env + login: -l comes before -c.
 #[test]
 fn guest_invocation_env_with_login() {
-    let env = vec!["KEY=val".to_string()];
-    let (prog, args) = build_guest_invocation("sh", &[], &env, true);
+    let env = HashMap::from([("KEY".to_string(), "val".to_string())]);
+    let (prog, args) = build_guest_invocation(&cmd("sh"), &env, true);
     assert_eq!(prog, "/bin/sh");
     assert_eq!(args[0], "-l");
     assert_eq!(args[1], "-c");
