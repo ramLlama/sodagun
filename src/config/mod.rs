@@ -110,6 +110,33 @@ pub struct SecretConfig {
     pub allowed_hosts: Vec<String>,
 }
 
+/// How much of the host repository's `.git` the sandbox guest can touch.
+///
+/// A linked worktree is not self-contained: its `.git` file points into the
+/// host repository.  When access is granted, the shared `.git` is mounted at
+/// `<working_dir>.git` (e.g. `/workspace.git`) and git inside the guest is
+/// wired to it via env vars injected at `sandbox start` (`GIT_DIR`,
+/// `GIT_COMMON_DIR`, `GIT_WORK_TREE`) — no host paths are mirrored.
+///
+/// - `none` (default): no git access; git commands fail inside the guest.
+/// - `data`: commits work, host code-execution surfaces stay read-only.
+///   `.git` is mounted read-only with nested read-write mounts for
+///   `objects/`, `refs/`, `logs/`, and the worktree's admin dir; the
+///   `commondir`/`gitdir` pointer files and the worktree's `.git` file are
+///   pinned read-only (host-side git still reads them — a guest rewriting
+///   them could point the host at attacker-controlled config/hooks).
+/// - `full`: the whole `.git` mounted read-write.  Simplest, but the guest
+///   can edit `config` and `hooks/`, which execute on the HOST the next
+///   time git runs there — use only with trusted agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitAccess {
+    #[default]
+    None,
+    Data,
+    Full,
+}
+
 // ── Raw sandbox config (for deserialization and merging) ──────────────────────
 
 /// Sandbox config as deserialized from TOML — all scalars are `Option` so that
@@ -119,6 +146,7 @@ pub struct RawSandboxConfig {
     pub working_dir: Option<String>,
     pub memory_mb: Option<u32>,
     pub cpus: Option<u8>,
+    pub git_access: Option<GitAccess>,
     #[serde(default)]
     pub volumes: Vec<String>,
     #[serde(default)]
@@ -138,6 +166,7 @@ pub struct SandboxConfig {
     pub working_dir: String,
     pub memory_mb: u32,
     pub cpus: u8,
+    pub git_access: GitAccess,
     pub volumes: Vec<String>,
     pub network: NetworkConfig,
     pub env: HashMap<String, EnvValue>,
@@ -439,6 +468,7 @@ pub fn merge_sandbox_configs(
         working_dir: user_wd,
         memory_mb: user_mem,
         cpus: user_cpus,
+        git_access: user_git,
         volumes: user_vols,
         network: user_net,
         env: user_env,
@@ -449,6 +479,7 @@ pub fn merge_sandbox_configs(
         working_dir: proj_wd,
         memory_mb: proj_mem,
         cpus: proj_cpus,
+        git_access: proj_git,
         volumes: proj_vols,
         network: proj_net,
         env: proj_env,
@@ -470,6 +501,7 @@ pub fn merge_sandbox_configs(
     let working_dir = proj_wd.or(user_wd).unwrap_or_else(default_working_dir);
     let memory_mb = proj_mem.or(user_mem).unwrap_or_else(default_memory_mb);
     let cpus = proj_cpus.or(user_cpus).unwrap_or_else(default_cpus);
+    let git_access = proj_git.or(user_git).unwrap_or_default();
 
     // Network: project > user for scalars; rules concatenated
     let policy = proj_net.policy.or(user_net.policy);
@@ -492,6 +524,7 @@ pub fn merge_sandbox_configs(
         working_dir,
         memory_mb,
         cpus,
+        git_access,
         volumes,
         network: NetworkConfig {
             policy,

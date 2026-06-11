@@ -7,6 +7,7 @@ mod commands;
 mod config;
 mod context;
 mod error;
+mod git_meta;
 mod util;
 mod workspace;
 
@@ -14,7 +15,6 @@ use commands::git::GitCommand;
 use commands::sandbox::SandboxCommand;
 use commands::snapshot::SnapshotCommand;
 use context::{Context, OutputFormat};
-use error::handle_error;
 
 #[derive(Parser)]
 #[command(
@@ -121,18 +121,52 @@ fn find_project_dir(override_dir: Option<PathBuf>, quiet: bool) -> PathBuf {
     project_dir
 }
 
+/// Raise the soft fd limit to the hard limit (clamped to a sane ceiling).
+///
+/// Sandbox VMs open an fd per virtiofs share, disk image, and socket; a
+/// parent like a GUI Emacs passes down macOS's default soft limit of 256,
+/// which makes the VM process SIGABRT during boot.  Children inherit the
+/// raised limit.
+fn raise_fd_limit() {
+    // macOS rejects rlim_cur = RLIM_INFINITY for NOFILE; clamp to a value
+    // safely under kern.maxfilesperproc.
+    const CEILING: libc::rlim_t = 32768;
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
+            lim.rlim_cur = lim.rlim_max.min(CEILING);
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+        }
+    }
+}
+
 fn main() {
+    raise_fd_limit();
     let cli = Cli::parse();
     let ctx = Context {
         output: cli.output,
         quiet: cli.quiet,
     };
     let project_dir = find_project_dir(cli.project_dir, cli.quiet);
-    util::check_msb_version().unwrap_or_else(|e| handle_error(ctx, e));
+
+    // The sandbox and snapshot groups drive the msb runtime; check once per
+    // dispatch. The git group is pure libgit2 and must work on hosts without
+    // a usable msb (e.g. inside a sandbox guest).
+    let require_msb =
+        |ctx: Context| util::check_msb_version().unwrap_or_else(|e| error::handle_error(ctx, e));
 
     match cli.command {
         Commands::Git(cmd) => commands::git::run(ctx, cmd, project_dir),
-        Commands::Sandbox(cmd) => commands::sandbox::run(ctx, cmd),
-        Commands::Snapshot(cmd) => commands::snapshot::run(ctx, cmd, project_dir),
+        Commands::Sandbox(cmd) => {
+            require_msb(ctx);
+            commands::sandbox::run(ctx, cmd)
+        }
+        Commands::Snapshot(cmd) => {
+            require_msb(ctx);
+            commands::snapshot::run(ctx, cmd, project_dir)
+        }
     }
 }

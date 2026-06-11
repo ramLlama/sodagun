@@ -13,8 +13,10 @@ use crate::workspace::WorkspaceMetadata;
 use clap::{Parser, Subcommand};
 use microsandbox::{MicrosandboxError, NetworkPolicy, Sandbox, Snapshot};
 
+mod git_access;
 mod network;
 mod values;
+use self::git_access::git_access_spec;
 use self::network::{apply_named_policy, apply_rule, parse_net_rule_value, to_sdk_action};
 use self::values::{resolve_env_value, resolve_secret_value, validate_value_str};
 
@@ -538,12 +540,51 @@ fn stop(ctx: Context, args: StopArgs) {
 }
 
 fn remove(ctx: Context, args: RemoveArgs) {
-    let sandbox_name = read_sandbox_name(ctx, &args.workspace_path);
+    // When metadata has no sandbox_name, fall back to the derived name
+    // (== workspace dir name): a failed `start` can leave an orphaned
+    // SDK-side sandbox record after its metadata rollback, and `remove`
+    // is the only way to clear it.
+    let meta =
+        WorkspaceMetadata::read(&args.workspace_path).unwrap_or_else(|e| handle_error(ctx, e));
+    let (sandbox_name, orphan_cleanup) = match meta.sandbox_name {
+        Some(name) => (name, false),
+        None => {
+            let derived = args
+                .workspace_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| {
+                    handle_error(
+                        ctx,
+                        SodagunError {
+                            code: "WORKSPACE_INVALID",
+                            message: format!(
+                                "cannot derive sandbox name from workspace path: {}",
+                                args.workspace_path.display()
+                            ),
+                        },
+                    )
+                });
+            (derived, true)
+        }
+    };
 
     let rt = util::get_runtime();
     let timeout = Duration::from_secs(args.stop_timeout_seconds);
     match rt.block_on(remove_async(&sandbox_name, timeout)) {
         Ok(()) => {}
+        // No metadata and nothing SDK-side either: keep the friendly
+        // "never started" error rather than SANDBOX_NOT_FOUND.
+        Err(e) if orphan_cleanup && e.code == "SANDBOX_NOT_FOUND" => handle_error(
+            ctx,
+            SodagunError {
+                code: "SANDBOX_NOT_STARTED",
+                message: format!(
+                    "no sandbox has been started for this workspace: {}",
+                    args.workspace_path.display()
+                ),
+            },
+        ),
         Err(e) => handle_error(ctx, e),
     }
 
@@ -744,6 +785,45 @@ async fn start_async(
             if flags.noexec { m.noexec() } else { m }
         });
     }
+
+    // Git access — mounts under <working_dir>.git plus GIT_* env wiring.
+    // Must come after the worktree mount: the `data` policy pins the
+    // worktree's `.git` file read-only inside it.
+    let host_gitconfig = std::env::var_os("HOME")
+        .map(|home| std::path::Path::new(&home).join(".gitconfig"))
+        .filter(|p| p.is_file());
+    let git_spec = git_access_spec(
+        worktree_path,
+        &sandbox_config.working_dir,
+        sandbox_config.git_access,
+        host_gitconfig.as_deref(),
+    )?;
+    for mount in &git_spec.mounts {
+        let host_str = mount
+            .host
+            .to_str()
+            .ok_or_else(|| SodagunError {
+                code: "GIT_ACCESS_INVALID",
+                message: format!("git path is non-UTF-8: {}", mount.host.display()),
+            })?
+            .to_owned();
+        let readonly = mount.readonly;
+        builder = builder.volume(&mount.guest, move |m| {
+            let m = m.bind(&host_str);
+            if readonly { m.readonly() } else { m }
+        });
+    }
+    // [sandbox.env]/[sandbox.secrets] entries win over the synthesized GIT_*
+    // vars (an escape hatch; the synthesized values are normally correct).
+    builder = builder.envs(
+        git_spec
+            .env
+            .iter()
+            .filter(|(k, _)| {
+                !sandbox_config.env.contains_key(k) && !sandbox_config.secrets.contains_key(k)
+            })
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
 
     // Env vars — resolve any dynamic sources (value_from_env, value_from_cmd) at launch time
     let resolved_env = sandbox_config

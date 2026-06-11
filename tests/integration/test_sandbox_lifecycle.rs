@@ -3,7 +3,7 @@ use std::path::Path;
 
 use predicates::prelude::*;
 
-use super::utils::{sodagun, sodagun_isolated};
+use super::utils::{skip_without_virt, sodagun, sodagun_isolated};
 
 /// Creates a minimal workspace with sandbox_name set to null.
 fn make_workspace(rootdir: &Path, branch: &str) {
@@ -263,6 +263,9 @@ fn remove_sandbox_not_found_json() {
 
 #[test]
 fn stop_running_sandbox() {
+    if skip_without_virt("stop_running_sandbox") {
+        return;
+    }
     // Use tmp.path() directly as the rootdir so the sandbox name is the unique tmpXXX
     // dirname rather than a hardcoded "workspace" that collides across concurrent runs.
     let tmp = tempfile::TempDir::new().unwrap();
@@ -295,6 +298,9 @@ fn stop_running_sandbox() {
 
 #[test]
 fn remove_running_sandbox_implicit_stop() {
+    if skip_without_virt("remove_running_sandbox_implicit_stop") {
+        return;
+    }
     let tmp = tempfile::TempDir::new().unwrap();
     let xdg_tmp = tempfile::TempDir::new().unwrap();
     let rootdir = tmp.path();

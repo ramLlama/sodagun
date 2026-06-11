@@ -197,6 +197,17 @@ fn add_worktree(ctx: Context, args: AddWorktreeArgs, project_dir: PathBuf) {
             )
         });
 
+    // libgit2 writes an absolute host path into the worktree's commondir;
+    // normalize it to the conventional relative `../..` so the worktree
+    // stays usable when the repo is reached at a different path (e.g.
+    // mounted into a sandbox guest, where some git codepaths read commondir
+    // even when GIT_COMMON_DIR is set).
+    if let Err(e) = crate::git_meta::normalize_commondir(&worktree_path) {
+        let _ = branch.delete();
+        let _ = std::fs::remove_dir_all(&rootdir);
+        handle_error(ctx, e);
+    }
+
     // Write workspace metadata; roll back everything on failure. repo_path is
     // already canonical (resolved at the top), so store it directly.
     let meta = WorkspaceMetadata::new(repo_path, args.branch_name.clone(), worktree_path.clone());

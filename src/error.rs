@@ -16,7 +16,7 @@ pub fn handle_error(ctx: Context, err: SodagunError) -> ! {
         OutputFormat::Json => {
             println!(
                 "{}",
-                serde_json::json!({"status": "error", "code": err.code})
+                serde_json::json!({"status": "error", "code": err.code, "message": err.message})
             );
         }
         OutputFormat::Text => {

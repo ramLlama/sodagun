@@ -11,6 +11,8 @@ Options:
 
 Rootdir: `<dir-prefix>/sodagun_<repo>_<branch>_<uuid8>` (note: `_`-delimited; `<repo>` and `<branch>` components are run through `util::dashify`, which collapses `/ _ : @` and space to `-`, keeping `_` unambiguous as the separator). The worktree itself lives at `<rootdir>/<sanitized-branch>`.
 
+After creating the worktree, `add-worktree` normalizes the worktree's `commondir` (in `<repo>/.git/worktrees/<name>/commondir`) from the absolute host path libgit2 writes to the conventional relative `../..` (the form the git CLI uses), via `git_meta::normalize_commondir`. This is needed because some git codepaths read `commondir` even when `GIT_COMMON_DIR` is set, and an absolute host path there breaks guest git (mounted into a sandbox) with "Invalid path". Normalization failure (`GIT_ERROR`) rolls back the branch + rootdir.
+
 JSON success: `{"status": "ok", "rootdir": "..."}`
 JSON error: `{"status": "error", "code": "<CODE>"}`
 
@@ -35,6 +37,8 @@ Options:
 - `--force` — recreate even if the snapshot already exists
 
 The ephemeral builder is sized by `snapshot_build_resources()`: half of total system RAM and all-but-two logical CPUs (minimum 1; unknown parallelism falls back to 1). It always runs with `NetworkPolicy::allow_all()` and an 8 GiB tmpfs `/tmp`.
+
+Gotcha: the derived snapshot name hashes the setup script **and** the `setup_files` contents (for this repo, `Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml`). Changing any of those — e.g. a dependency bump — changes the hash, so `sandbox start` will look for a snapshot that doesn't exist yet and you must re-run `sodagun snapshot create`.
 
 JSON success: `{"status": "ok", "snapshot_name": "...", "already_existed": false}`
 
