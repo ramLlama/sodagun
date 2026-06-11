@@ -72,15 +72,12 @@ pub fn git_access_spec(
         ("GIT_COMMON_DIR".to_string(), guest_git.clone()),
         ("GIT_WORK_TREE".to_string(), working_dir.to_string()),
         // Injected git config (override wholesale via [sandbox.env] if needed):
-        // - hooks off: repo hooks were installed for the HOST environment
-        //   (their tooling is usually absent in the guest);
-        // - auto-gc off: gc wants packed-refs.lock at the .git top level,
-        //   which is read-only under the `data` policy.
-        ("GIT_CONFIG_COUNT".to_string(), "2".to_string()),
-        ("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string()),
-        ("GIT_CONFIG_VALUE_0".to_string(), "/dev/null".to_string()),
-        ("GIT_CONFIG_KEY_1".to_string(), "gc.auto".to_string()),
-        ("GIT_CONFIG_VALUE_1".to_string(), "0".to_string()),
+        // auto-gc off, because gc wants packed-refs.lock at the .git top
+        // level, which is read-only under the `data` policy.  Repo hooks
+        // run normally — provision their tooling in the snapshot.
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        ("GIT_CONFIG_KEY_0".to_string(), "gc.auto".to_string()),
+        ("GIT_CONFIG_VALUE_0".to_string(), "0".to_string()),
     ];
     if gitconfig.is_some() {
         env.push(("GIT_CONFIG_GLOBAL".to_string(), guest_gitconfig.clone()));
@@ -214,16 +211,13 @@ mod tests {
             env.get("GIT_WORK_TREE").map(String::as_str),
             Some("/workspace")
         );
-        // Hooks and auto-gc are disabled for guest git.
-        assert_eq!(env.get("GIT_CONFIG_COUNT").map(String::as_str), Some("2"));
+        // Auto-gc is disabled for guest git (hooks run normally).
+        assert_eq!(env.get("GIT_CONFIG_COUNT").map(String::as_str), Some("1"));
         assert_eq!(
             env.get("GIT_CONFIG_KEY_0").map(String::as_str),
-            Some("core.hooksPath")
-        );
-        assert_eq!(
-            env.get("GIT_CONFIG_KEY_1").map(String::as_str),
             Some("gc.auto")
         );
+        assert_eq!(env.get("GIT_CONFIG_VALUE_0").map(String::as_str), Some("0"));
     }
 
     #[test]
