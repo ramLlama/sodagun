@@ -105,6 +105,9 @@ tests/
     test_sandbox_start.rs
     test_sandbox_lifecycle.rs
     test_snapshot.rs
+    utils.rs            # sodagun()/sodagun_isolated() command builders, has_virtualization()/skip_without_virt() VM-test guards
+scripts/
+  require-virt.sh       # pre-push gate: blocks pushing from hosts that cannot boot VMs (where VM-boot tests self-skip)
 Cargo.toml
 deny.toml             # cargo-deny policy (permissive license allowances + microsandbox advisory ignores)
 Makefile
@@ -124,7 +127,9 @@ Detailed invariants and dependency list: [architecture.md](architecture.md).
 ```bash
 make all              # check-all + build-release-thin
 make check-all        # fmt + lint + typecheck + test + audit
-make test             # cargo test
+make test             # test-unit + test-integration
+make test-unit        # cargo test --bin sodagun (in-source tests; no msb/git needed)
+make test-integration # cargo test --test integration (spawns the binary; needs git; VM-boot tests skip without hardware virtualization)
 make typecheck        # cargo check --all-targets
 make lint             # cargo clippy --all-targets --all-features -- -D warnings
 make fmt              # cargo fmt --all

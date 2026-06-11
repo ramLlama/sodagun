@@ -1,4 +1,4 @@
-.PHONY: deps fmt fmt-check lint typecheck test audit build-debug build-release-thin build-release install uninstall clean all
+.PHONY: deps fmt fmt-check lint typecheck test test-unit test-integration audit build-debug build-release-thin build-release install uninstall clean all
 
 _default: all
 
@@ -19,8 +19,17 @@ lint:
 typecheck:
 	cargo check --all-targets
 
-test:
-	cargo test
+test: test-unit test-integration
+
+# In-source #[cfg(test)] tests: pure, need neither msb nor git.
+test-unit:
+	cargo test --bin sodagun
+
+# Spawns the sodagun binary; needs git for repo fixtures. VM-boot tests
+# additionally need hardware virtualization and skip themselves without it
+# (the require-virt pre-push hook blocks pushing from such hosts).
+test-integration:
+	cargo test --test integration
 
 audit:
 	cargo deny check

@@ -4,7 +4,7 @@ use std::path::Path;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-use super::utils::{sodagun, sodagun_isolated};
+use super::utils::{skip_without_virt, sodagun, sodagun_isolated};
 
 /// Write a `sodagun.toml` to a temp directory and return the dir.
 fn config_dir(content: &str) -> TempDir {
@@ -313,6 +313,9 @@ fn snapshot_remove_force_nonexistent_succeeds() {
 
 #[test]
 fn snapshot_create_and_idempotent() {
+    if skip_without_virt("snapshot_create_and_idempotent") {
+        return;
+    }
     let setup_script = "#!/bin/sh\napk add --no-cache git\n";
     let toml = format!(
         "[image]\nbase_image = \"alpine:latest\"\nsetup_script = {:?}\n",
@@ -377,6 +380,9 @@ fn snapshot_create_and_idempotent() {
 
 #[test]
 fn snapshot_create_force_recreates() {
+    if skip_without_virt("snapshot_create_force_recreates") {
+        return;
+    }
     let setup_script = "#!/bin/sh\napk add --no-cache curl\n";
     let toml = format!(
         "[image]\nbase_image = \"alpine:latest\"\nsetup_script = {:?}\n",
@@ -411,6 +417,9 @@ fn snapshot_create_force_recreates() {
 /// are baked into the snapshot.
 #[test]
 fn snapshot_setup_script_side_effects_persist() {
+    if skip_without_virt("snapshot_setup_script_side_effects_persist") {
+        return;
+    }
     let xdg_tmp = TempDir::new().unwrap();
 
     // 1. Build a snapshot that installs git on top of alpine:latest.

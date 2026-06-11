@@ -15,7 +15,6 @@ use commands::git::GitCommand;
 use commands::sandbox::SandboxCommand;
 use commands::snapshot::SnapshotCommand;
 use context::{Context, OutputFormat};
-use error::handle_error;
 
 #[derive(Parser)]
 #[command(
@@ -152,11 +151,22 @@ fn main() {
         quiet: cli.quiet,
     };
     let project_dir = find_project_dir(cli.project_dir, cli.quiet);
-    util::check_msb_version().unwrap_or_else(|e| handle_error(ctx, e));
+
+    // The sandbox and snapshot groups drive the msb runtime; check once per
+    // dispatch. The git group is pure libgit2 and must work on hosts without
+    // a usable msb (e.g. inside a sandbox guest).
+    let require_msb =
+        |ctx: Context| util::check_msb_version().unwrap_or_else(|e| error::handle_error(ctx, e));
 
     match cli.command {
         Commands::Git(cmd) => commands::git::run(ctx, cmd, project_dir),
-        Commands::Sandbox(cmd) => commands::sandbox::run(ctx, cmd),
-        Commands::Snapshot(cmd) => commands::snapshot::run(ctx, cmd, project_dir),
+        Commands::Sandbox(cmd) => {
+            require_msb(ctx);
+            commands::sandbox::run(ctx, cmd)
+        }
+        Commands::Snapshot(cmd) => {
+            require_msb(ctx);
+            commands::snapshot::run(ctx, cmd, project_dir)
+        }
     }
 }

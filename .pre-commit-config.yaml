@@ -19,6 +19,13 @@ repos:
         entry: make audit
         pass_filenames: false
 
+      - id: require-virt
+        name: require virtualization (VM-boot tests must really run)
+        language: system
+        entry: scripts/require-virt.sh
+        pass_filenames: false
+        stages: [pre-push]
+
       - id: cargo-test
         name: cargo test
         language: system

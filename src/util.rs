@@ -26,8 +26,10 @@ const REQUIRED_MSB_VERSION: (u32, u32, u32) = (0, 5, 0);
 ///
 /// The SDK resolution order prefers `~/.microsandbox/bin/msb` over the system
 /// PATH, so a stale system-managed binary can silently shadow a current one and
-/// produce cryptic protocol errors. Checking early surfaces a clear
-/// "run: msb self update" message before any SDK call is made.
+/// produce cryptic protocol errors. Run once in `main()` when dispatching the
+/// `sandbox` and `snapshot` command groups (which drive the msb runtime), and
+/// deliberately NOT for the `git` group: pure-libgit2 commands must work on
+/// hosts without a usable msb — e.g. inside a sandbox guest.
 pub fn check_msb_version() -> Result<(), SodagunError> {
     let msb_path = microsandbox::config::resolve_msb_path().map_err(|e| SodagunError {
         code: "SANDBOX_ERROR",

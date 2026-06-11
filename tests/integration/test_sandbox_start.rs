@@ -4,7 +4,7 @@ use std::path::Path;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
-use super::utils::{sodagun, sodagun_isolated};
+use super::utils::{skip_without_virt, sodagun, sodagun_isolated};
 
 /// Create a minimal workspace (rootdir + sodagun.json + worktree subdir) without
 /// needing a real git repo. Sufficient for config-error path tests.
@@ -392,6 +392,9 @@ fn config_invalid_reserved_policy_name_redefined_in_file() {
 
 #[test]
 fn start_creates_sandbox() {
+    if skip_without_virt("start_creates_sandbox") {
+        return;
+    }
     // Use tmp.path() directly so the sandbox name is the unique tmpXXX dirname.
     let tmp = TempDir::new().unwrap();
     let xdg_tmp = TempDir::new().unwrap();
