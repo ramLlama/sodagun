@@ -689,3 +689,32 @@ fn parse_volume_missing_guest_error() {
     let err = parse_volume("/only-host").unwrap_err();
     assert_eq!(err.code, "CONFIG_INVALID");
 }
+
+/// `git_access` parses from TOML and merges with project > user > default none.
+#[test]
+fn git_access_parses_and_merges() {
+    let f = write_config("[image]\nbase_image = \"debian\"\n[sandbox]\ngit_access = \"data\"\n");
+    let (_, raw) = load_config(f.path()).unwrap();
+    assert_eq!(raw.git_access, Some(GitAccess::Data));
+
+    // project wins over user
+    let user = RawSandboxConfig {
+        git_access: Some(GitAccess::Full),
+        ..Default::default()
+    };
+    let merged = merge_sandbox_configs(Some(user), raw).unwrap();
+    assert_eq!(merged.git_access, GitAccess::Data);
+
+    // default is none
+    let merged = merge_sandbox_configs(None, RawSandboxConfig::default()).unwrap();
+    assert_eq!(merged.git_access, GitAccess::None);
+}
+
+/// Unknown `git_access` values are rejected.
+#[test]
+fn git_access_invalid_value_rejected() {
+    let f =
+        write_config("[image]\nbase_image = \"debian\"\n[sandbox]\ngit_access = \"sometimes\"\n");
+    let err = load_config(f.path()).unwrap_err();
+    assert_eq!(err.code, "CONFIG_INVALID");
+}

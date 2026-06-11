@@ -19,7 +19,8 @@ apt-get update -qq
 apt-get install -y --no-install-recommends \
   cmake pkg-config \
   curl ca-certificates make \
-  libssl-dev libcap-ng-dev
+  libssl-dev libcap-ng-dev \
+  socat python3 git
 
 #
 # rust setup
@@ -65,6 +66,7 @@ EOF
 
 [sandbox]
 working_dir = "/workspace"
+git_access  = "data"
 memory_mb   = 3072
 cpus        = 3
 

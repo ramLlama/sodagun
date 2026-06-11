@@ -255,10 +255,9 @@ fn repo_not_found_json() {
         .clone();
 
     let data: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        data,
-        serde_json::json!({"status": "error", "code": "REPO_NOT_FOUND"})
-    );
+    assert_eq!(data["status"], "error");
+    assert_eq!(data["code"], "REPO_NOT_FOUND");
+    assert!(data["message"].is_string(), "JSON errors carry the message");
 }
 
 #[test]
@@ -309,10 +308,9 @@ fn base_not_found_json() {
         .clone();
 
     let data: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        data,
-        serde_json::json!({"status": "error", "code": "BASE_NOT_FOUND"})
-    );
+    assert_eq!(data["status"], "error");
+    assert_eq!(data["code"], "BASE_NOT_FOUND");
+    assert!(data["message"].is_string(), "JSON errors carry the message");
 }
 
 #[test]
@@ -383,10 +381,9 @@ fn branch_already_exists_json() {
         .clone();
 
     let data: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(
-        data,
-        serde_json::json!({"status": "error", "code": "BRANCH_EXISTS"})
-    );
+    assert_eq!(data["status"], "error");
+    assert_eq!(data["code"], "BRANCH_EXISTS");
+    assert!(data["message"].is_string(), "JSON errors carry the message");
 }
 
 #[test]

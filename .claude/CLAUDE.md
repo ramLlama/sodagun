@@ -54,6 +54,7 @@ HOME = "/root"                # env vars for the ephemeral build sandbox during 
 working_dir = "/workspace"  # default
 memory_mb = 512             # default; type u32
 cpus = 1                    # default; type u8 (serde rejects values > 255 at parse time)
+git_access = "none"         # default; "none" | "data" | "full" — how much of the host .git the guest can touch (project > user > default)
 volumes = ["~/.config/claude:/root/.config/claude:ro,noexec"]  # "host:guest" or "host:guest:OPTIONS" (comma-separated: ro, rw, noexec)
 
 [sandbox.network]
@@ -78,17 +79,21 @@ User-level config (`~/.config/sodagun/sodagun.toml`, `network-policy.d/`) and al
 
 ```
 src/
-  main.rs             # clap Cli struct (--output/--quiet/--project-dir), main(), find_project_dir(), dispatch
+  main.rs             # clap Cli struct (--output/--quiet/--project-dir), main(), raise_fd_limit(), find_project_dir(), dispatch
   context.rs          # OutputFormat (clap::ValueEnum, Default) + Context { output, quiet }; Context::log()/warn() (stderr, suppressed by --quiet)
-  error.rs            # SodagunError (#[derive(Debug)]), handle_error() -> !
+  error.rs            # SodagunError { code, message } (#[derive(Debug)]), handle_error() -> ! (JSON envelope includes both code AND message)
   workspace.rs        # WorkspaceMetadata (sodagun.json: version, repo_path, branch, created_at, worktree_path, sandbox_name) + new()/read()/write()/set_sandbox_name()
-  config.rs           # sodagun.toml parser; ImageConfig (incl. setup_files: Vec<SetupFile>, env), SetupFile { name, content }, RawSandboxConfig (Option scalars, for parse+merge) / SandboxConfig (resolved), NetworkConfig (policy: Option<String>, default_egress/ingress, rules), NetworkRule, NamedPolicy, EnvValue (untagged Literal|Dynamic), ValueSource, SecretConfig, ConfigAction/Direction/Protocol, SETUP_SCRIPT_NAME, RESERVED_POLICY_NAMES, load_config() (→ ImageConfig + RawSandboxConfig), load_image_config(), load_user_sandbox_config(), load_network_policies(), merge_sandbox_configs(), config_path(), snapshot_name(), parse_volume(), default_image_config()
+  git_meta.rs         # linked-worktree git metadata resolvers: worktree_admin_dir() (from .git gitdir: pointer), common_git_dir() (from admin commondir), normalize_commondir() (rewrite admin commondir to relative ../..)
+  config/
+    mod.rs            # sodagun.toml parser; ImageConfig (incl. setup_files: Vec<SetupFile>, env), SetupFile { name, content }, GitAccess (None|Data|Full, lowercase serde), RawSandboxConfig (Option scalars, for parse+merge) / SandboxConfig (resolved), NetworkConfig (policy: Option<String>, default_egress/ingress, rules), NetworkRule, NamedPolicy, EnvValue (untagged Literal|Dynamic), ValueSource, SecretConfig, ConfigAction/Direction/Protocol, SETUP_SCRIPT_NAME, RESERVED_POLICY_NAMES, load_config(), load_image_config(), load_user_sandbox_config(), load_network_policies(), merge_sandbox_configs(), config_path(), snapshot_name(), parse_volume(), default_image_config()
+    tests.rs          # #[cfg(test)] config unit tests
   util.rs             # dashify() name sanitizer + the microsandbox SDK↔sodagun layer: get_runtime() (OnceLock singleton), map_sandbox_err(), map_snapshot_err(), status_label()
   commands/
     mod.rs
-    git.rs            # GitCommand sub-app; add_worktree logic
+    git.rs            # GitCommand sub-app; add_worktree logic (normalizes the new worktree's commondir via git_meta::normalize_commondir)
     sandbox/
       mod.rs          # SandboxCommand sub-app; start()/attach()/exec()/list()/stop()/remove() + private async impls, read_sandbox_name(); CliNetOptions (bundles the three --net-* overrides for start_async); build_guest_invocation() (shell-wrapper builder), shell_single_quote(), validate_env_kv()
+      git_access.rs   # git_access_spec() → GitAccessSpec { mounts, env } implementing the GitAccess policy (mounts under <working_dir>.git + GIT_* env wiring)
       values.rs       # env/secret value resolution (run_value_cmd, validate_value_str, resolve_value_source, resolve_env_value, resolve_secret_value)
       network.rs      # network-policy building (apply_named_policy, apply_rule, commit_dest, to_sdk_action) + CLI net-rule SPEC parsing (parse_net_rule_value, parse_net_rule_spec)
       tests.rs        # #[cfg(test)] unit tests for the sandbox module
@@ -108,7 +113,7 @@ Makefile
 
 Key invariants (the most important few — the rest are in [architecture.md](architecture.md)):
 - `handle_error()` returns `!` (Never type) — always calls `std::process::exit(1)` after printing; the Rust equivalent of Python's `NoReturn`. Top-level error handling uses the `handle_error(ctx, SodagunError { code, message }) -> !` pattern rather than `?` / `Result` propagation, so error codes and exit semantics stay explicit
-- Text errors go to stderr (`eprintln!`); JSON errors go to stdout (`println!`) so `--output json` output is always parseable. `get_runtime()` and `find_project_dir()` are the deliberate exceptions: their pre-command failures exit via plain stderr without a JSON envelope
+- Text errors go to stderr (`eprintln!`); JSON errors go to stdout (`println!`) so `--output json` output is always parseable. The JSON error envelope carries both `code` and `message` (`{"status":"error","code":…,"message":…}`) so programmatic callers (e.g. baton) see the actual failure cause, not just the code. `get_runtime()` and `find_project_dir()` are the deliberate exceptions: their pre-command failures exit via plain stderr without a JSON envelope
 - Async SDK calls are bridged to the synchronous handlers with the shared `util::get_runtime()` runtime; the `*_async` functions own all `.await`s and are private to their command module
 - `build_guest_invocation(cmd, args, env, login)` centralizes the in-guest shell wrapper for both `attach` and `exec`: it returns a direct `(cmd, args)` invocation when `env` is empty and `login` is false, otherwise wraps in `sh [-l] -c 'export K=V; …; exec "$0" "$@"' cmd args` (env values POSIX single-quote-escaped)
 
@@ -136,7 +141,7 @@ Full testing conventions: [testing.md](testing.md).
 
 ## Style
 
-- Rust 2024 edition, no `unsafe` (the one exception: `#[cfg(test)]` env-var mutation in `config.rs` tests)
+- Rust 2024 edition, `unsafe` confined to two spots: `raise_fd_limit()` in `main.rs` (libc `getrlimit`/`setrlimit`) and the `#[cfg(test)]` env-var mutation in `config/tests.rs`
 - Error handling at the top level uses `handle_error(ctx, SodagunError { code, message }) -> !` (not `?` propagation) so every exit point carries an explicit error code
 - `colored` crate for styled stderr: `"Error".red().bold()`, `"warning:".yellow().bold()`
 - Name sanitization goes through `util::dashify` rather than per-site `.replace(...)`

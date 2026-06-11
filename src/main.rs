@@ -7,6 +7,7 @@ mod commands;
 mod config;
 mod context;
 mod error;
+mod git_meta;
 mod util;
 mod workspace;
 
@@ -121,7 +122,30 @@ fn find_project_dir(override_dir: Option<PathBuf>, quiet: bool) -> PathBuf {
     project_dir
 }
 
+/// Raise the soft fd limit to the hard limit (clamped to a sane ceiling).
+///
+/// Sandbox VMs open an fd per virtiofs share, disk image, and socket; a
+/// parent like a GUI Emacs passes down macOS's default soft limit of 256,
+/// which makes the VM process SIGABRT during boot.  Children inherit the
+/// raised limit.
+fn raise_fd_limit() {
+    // macOS rejects rlim_cur = RLIM_INFINITY for NOFILE; clamp to a value
+    // safely under kern.maxfilesperproc.
+    const CEILING: libc::rlim_t = 32768;
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
+            lim.rlim_cur = lim.rlim_max.min(CEILING);
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+        }
+    }
+}
+
 fn main() {
+    raise_fd_limit();
     let cli = Cli::parse();
     let ctx = Context {
         output: cli.output,

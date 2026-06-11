@@ -63,6 +63,8 @@ JSON success: `{"status": "ok"}`
 
 Reads the sandbox name from `sodagun.json`. If the sandbox is still running, sends a stop signal and polls until it halts before `Sandbox::remove(name)`. Clears `sandbox_name` in `sodagun.json` on success.
 
+When `sodagun.json` has no `sandbox_name`, `remove` falls back to the **derived** name (the workspace dir name): a failed `start` can orphan an SDK-side sandbox record after its metadata rollback, and `remove` is the only way to clear it. In that fallback path, a `SANDBOX_NOT_FOUND` from the SDK (i.e. nothing orphaned either — a never-started workspace) is remapped to the friendlier `SANDBOX_NOT_STARTED`.
+
 Options:
 - `--stop-timeout-seconds <N>` — seconds to wait for the implicit stop phase (default: 30)
 
@@ -71,7 +73,7 @@ JSON success: `{"status": "ok"}`
 
 ## Sandbox / workspace error codes
 
-`WORKSPACE_NOT_FOUND`, `WORKSPACE_INVALID`, `WORKTREE_NOT_FOUND`, `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `SANDBOX_NOT_STARTED`, `SANDBOX_ALREADY_STARTED`, `SANDBOX_NOT_FOUND`, `SANDBOX_ERROR`
+`WORKSPACE_NOT_FOUND`, `WORKSPACE_INVALID`, `WORKTREE_NOT_FOUND`, `CONFIG_NOT_FOUND`, `CONFIG_INVALID`, `GIT_ERROR`, `GIT_ACCESS_INVALID`, `SANDBOX_NOT_STARTED`, `SANDBOX_ALREADY_STARTED`, `SANDBOX_NOT_FOUND`, `SANDBOX_ERROR`
 
 - `WORKSPACE_NOT_FOUND` — no `sodagun.json` in the given rootdir (was it created by sodagun?)
 - `WORKSPACE_INVALID` — `sodagun.json` is malformed, unreadable, or fails to serialize/write
@@ -83,6 +85,8 @@ JSON success: `{"status": "ok"}`
 - `SANDBOX_NOT_FOUND` — named sandbox does not exist (maps `MicrosandboxError::SandboxNotFound`)
 - `SANDBOX_ERROR` — microsandbox SDK failure (runtime creation, `create_detached`, `start`, `attach`/`exec`, stop/remove ops, stop timeout)
 - `WORKSPACE_INVALID` is also emitted by `sandbox start` when the workspace path has no directory name (sandbox name can't be derived)
+- `GIT_ERROR` — (from `git_meta` resolvers, surfaced during `git_access` mount synthesis) the worktree's `.git` file is unreadable / has no `gitdir:` pointer, or a `commondir`/admin path fails to canonicalize
+- `GIT_ACCESS_INVALID` — `git_access` mount synthesis failed: the admin dir has no name, a required `.git` subdir (e.g. `logs/`) can't be created, or a git mount host path is non-UTF-8
 
 ## User-level config files
 
@@ -91,7 +95,7 @@ Two optional **user-level** config files live under `$XDG_CONFIG_HOME/sodagun/` 
 `~/.config/sodagun/sodagun.toml` — a user-level `[sandbox]` config (no `[image]` section; silently ignored if present). Loaded by `load_user_sandbox_config()` and merged with the project `[sandbox]` via `merge_sandbox_configs()`:
 - `volumes`: user first, then project appended
 - `env` / `secrets`: union; project wins on key conflict
-- Scalars (`working_dir`, `memory_mb`, `cpus`): project > user > built-in default
+- Scalars (`working_dir`, `memory_mb`, `cpus`, `git_access`): project > user > built-in default (`git_access` defaults to `none`)
 - `network.policy` / `default_egress` / `default_ingress`: project > user; `network.rules`: user inline first, then project inline
 
 `~/.config/sodagun/network-policy.d/<name>.toml` — custom named network policies (loaded by `load_network_policies()`). Each `.toml` file defines one policy; the policy name is the file stem. Files are loaded in alphabetical order:
@@ -126,6 +130,12 @@ Note: snapshot-build sizing (memory/cpus for the ephemeral builder) is derived f
 - A key may not appear in both `[sandbox.env]` and `[sandbox.secrets]` — validated in `merge_sandbox_configs` (on the *merged* result), not `load_config`
 - Network policy is named, not a mode: `[sandbox.network].policy` selects a built-in (`none` → `default_deny()`, `allow-all` → `default_allow()`, `public-only` → hand-built to mirror `NetworkPolicy::public_only()`) or a custom policy from `network-policy.d/`. Built-ins are resolved first and shadow any same-named custom policy. An unknown name is `CONFIG_INVALID`; the error shows the directory path if it exists, else the built-in list. `default_egress`/`default_ingress`/`rules` (inline or from the named policy) layer on via `apply_named_policy()` + `apply_rule()`
 - `cpus` is `u8` so serde rejects out-of-range values at parse time with `CONFIG_INVALID`
+- `git_access` (`"none"` | `"data"` | `"full"`, default `none`; `GitAccess` enum, lowercase serde) controls how much of the host repo's `.git` the guest can touch. A linked worktree's `.git` file points into the host repo, so guest git needs the host `.git` material. Rather than mirroring host paths, the shared `.git` is mounted at `<working_dir>.git` (e.g. `/workspace.git`) and git is wired via env injected at `sandbox start`: `GIT_DIR=<working_dir>.git/worktrees/<name>`, `GIT_COMMON_DIR=<working_dir>.git`, `GIT_WORK_TREE=<working_dir>`. Two git-config pairs are also injected via `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`: `core.hooksPath=/dev/null` (host-installed hooks lack their tooling in-guest) and `gc.auto=0` (gc wants `packed-refs.lock` at the read-only `.git` top level). All synthesized `GIT_*` vars are an escape hatch: any matching `[sandbox.env]`/`[sandbox.secrets]` key **wins** over the synthesized value.
+  - `none` (default): no mounts, no env; git commands fail inside the guest.
+  - `data`: `.git` mounted **read-only**, with nested **read-write** mounts for `objects/`, `refs/`, `logs/` (created on demand so the mount source exists) and the worktree's admin dir. The admin dir's `commondir`/`gitdir` pointer files AND the worktree's own `.git` file are pinned **read-only** — host-side git reads those, and a guest rewriting them could aim host git at attacker-controlled config/hooks (host code execution). Threat model: the read-write surfaces are data-only.
+  - `full`: the whole `.git` mounted **read-write** — the guest can edit `config`/`hooks/`, which execute on the **host** the next time git runs there. Only for trusted agents.
+  - Host `~/.gitconfig` (if it exists) is mounted at `<working_dir>.gitconfig` (read-only under `data`, read-write under `full`) and wired via `GIT_CONFIG_GLOBAL` — guest homes differ from the host's, so this carries the user's commit identity into the guest.
+  - Implemented in `commands/sandbox/git_access.rs` (`git_access_spec` → `GitAccessSpec { mounts, env }`); wired into the builder in `start_async` **after** the worktree mount (the `data` policy's `.git`-file pin layers over the worktree mount, and parents must precede nested children). Errors: `GIT_ERROR` / `GIT_ACCESS_INVALID`.
 - Volume strings are Docker-style `"host:guest"` or `"host:guest:OPTIONS"`, where `OPTIONS` is a comma-separated list of `ro` (read-only), `rw` (explicit read-write; no-op), and `noexec` (disable direct execution from the mount). An unknown option is `CONFIG_INVALID`. `config::parse_volume` returns `(PathBuf, String, MountFlags)` where `MountFlags { readonly: bool, noexec: bool }`. Tilde (`~`) expansion to `$HOME` happens at launch time (`config::parse_volume`), not config-parse time
 - `[sandbox.env]` values are either a plain string (`EnvValue::Literal`) or a dynamic `ValueSource` (`value` / `value_from_env` / `value_from_cmd`) — the same three sources as secrets. Exactly one source must be set (enforced at launch, not parse). `value_from_env` / `value_from_cmd` are resolved at launch time, not config-parse time, so values stay out of the parsed struct
 - `value_from_cmd` runs via `sh -c <cmd>` on the host; non-zero exit is `CONFIG_INVALID`; stdout is trimmed before use
